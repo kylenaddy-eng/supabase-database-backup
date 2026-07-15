@@ -2895,50 +2895,105 @@ CREATE OR REPLACE FUNCTION "public"."lookup_cost_supplier_by_identifiers"("p_vat
     SET "search_path" TO 'public'
     AS $$
 DECLARE
-  v_key text;
+  v_reg_key text;
+  v_vat_key text;
+  v_name_key text;
+  v_legal_key text;
+  v_supplier_id uuid;
+  v_canonical text;
+  v_owners int;
 BEGIN
-  v_key := public.normalize_vat_number(p_vat);
-  IF v_key IS NOT NULL THEN
-    RETURN QUERY
-    SELECT cs.id, cs.canonical_name
-      FROM public.cost_supplier_identifiers csi
-      JOIN public.cost_suppliers cs ON cs.id = csi.supplier_id
-     WHERE csi.identifier_type = 'vat'
-       AND csi.identifier_key = v_key
-     LIMIT 1;
-    IF FOUND THEN
-      RETURN;
-    END IF;
-  END IF;
-
-  v_key := public.normalize_company_registration(p_company_reg);
-  IF v_key IS NOT NULL THEN
-    RETURN QUERY
-    SELECT cs.id, cs.canonical_name
-      FROM public.cost_supplier_identifiers csi
-      JOIN public.cost_suppliers cs ON cs.id = csi.supplier_id
-     WHERE csi.identifier_type = 'company_registration'
-       AND csi.identifier_key = v_key
-     LIMIT 1;
-    IF FOUND THEN
-      RETURN;
-    END IF;
-  END IF;
-
+  -- 1) Legal name: distinguishes group members that share a VAT / reg number.
+  --    Match a supplier by its canonical match-key or a stored legal_name id.
   IF p_name IS NOT NULL
      AND btrim(p_name) <> ''
      AND upper(btrim(p_name)) <> 'NA' THEN
-    v_key := public.supplier_legal_name_key(p_name);
-    IF v_key IS NOT NULL THEN
-      RETURN QUERY
+    v_name_key := public.company_match_key(p_name);
+    IF v_name_key IS NOT NULL AND v_name_key <> '' THEN
       SELECT cs.id, cs.canonical_name
+        INTO v_supplier_id, v_canonical
+        FROM public.cost_suppliers cs
+       WHERE public.company_match_key(cs.canonical_name) = v_name_key
+       ORDER BY cs.created_at ASC
+       LIMIT 1;
+      IF v_supplier_id IS NOT NULL THEN
+        supplier_id := v_supplier_id;
+        canonical_name := v_canonical;
+        RETURN NEXT;
+        RETURN;
+      END IF;
+    END IF;
+
+    v_legal_key := public.supplier_legal_name_key(p_name);
+    IF v_legal_key IS NOT NULL THEN
+      SELECT cs.id, cs.canonical_name
+        INTO v_supplier_id, v_canonical
         FROM public.cost_supplier_identifiers csi
         JOIN public.cost_suppliers cs ON cs.id = csi.supplier_id
        WHERE csi.identifier_type = 'legal_name'
-         AND csi.identifier_key = v_key
+         AND csi.identifier_key = v_legal_key
+       ORDER BY csi.created_at ASC
        LIMIT 1;
+      IF v_supplier_id IS NOT NULL THEN
+        supplier_id := v_supplier_id;
+        canonical_name := v_canonical;
+        RETURN NEXT;
+        RETURN;
+      END IF;
     END IF;
   END IF;
+
+  -- 2) Company registration number: catches name typos, but only when it maps
+  --    to exactly one supplier (a shared/group reg is ambiguous once the legal
+  --    name has failed to match).
+  v_reg_key := public.normalize_company_registration(p_company_reg);
+  IF v_reg_key IS NOT NULL THEN
+    SELECT count(DISTINCT csi.supplier_id)
+      INTO v_owners
+      FROM public.cost_supplier_identifiers csi
+     WHERE csi.identifier_type = 'company_registration'
+       AND csi.identifier_key = v_reg_key;
+    IF v_owners = 1 THEN
+      SELECT cs.id, cs.canonical_name
+        INTO v_supplier_id, v_canonical
+        FROM public.cost_supplier_identifiers csi
+        JOIN public.cost_suppliers cs ON cs.id = csi.supplier_id
+       WHERE csi.identifier_type = 'company_registration'
+         AND csi.identifier_key = v_reg_key
+       LIMIT 1;
+      supplier_id := v_supplier_id;
+      canonical_name := v_canonical;
+      RETURN NEXT;
+      RETURN;
+    END IF;
+  END IF;
+
+  -- 3) VAT number: same rule — only trusted when it maps to exactly one
+  --    supplier. Otherwise defer to the name-based fallback (create/find by
+  --    name) rather than guessing the wrong entity.
+  v_vat_key := public.normalize_vat_number(p_vat);
+  IF v_vat_key IS NOT NULL THEN
+    SELECT count(DISTINCT csi.supplier_id)
+      INTO v_owners
+      FROM public.cost_supplier_identifiers csi
+     WHERE csi.identifier_type = 'vat'
+       AND csi.identifier_key = v_vat_key;
+    IF v_owners = 1 THEN
+      SELECT cs.id, cs.canonical_name
+        INTO v_supplier_id, v_canonical
+        FROM public.cost_supplier_identifiers csi
+        JOIN public.cost_suppliers cs ON cs.id = csi.supplier_id
+       WHERE csi.identifier_type = 'vat'
+         AND csi.identifier_key = v_vat_key
+       LIMIT 1;
+      supplier_id := v_supplier_id;
+      canonical_name := v_canonical;
+      RETURN NEXT;
+      RETURN;
+    END IF;
+  END IF;
+
+  RETURN;
 END;
 $$;
 
@@ -4114,7 +4169,6 @@ DECLARE
   v_vat_key text;
   v_reg_key text;
   v_name_key text;
-  v_existing_supplier uuid;
 BEGIN
   IF p_supplier_id IS NULL THEN
     RETURN;
@@ -4122,34 +4176,22 @@ BEGIN
 
   v_vat_key := public.normalize_vat_number(p_vat);
   IF v_vat_key IS NOT NULL THEN
-    SELECT supplier_id INTO v_existing_supplier
-      FROM public.cost_supplier_identifiers
-     WHERE identifier_type = 'vat'
-       AND identifier_key = v_vat_key;
-    IF v_existing_supplier IS NULL OR v_existing_supplier = p_supplier_id THEN
-      INSERT INTO public.cost_supplier_identifiers (
-        supplier_id, identifier_type, identifier_key, raw_value, source_invoice_id
-      ) VALUES (
-        p_supplier_id, 'vat', v_vat_key, nullif(btrim(p_vat), ''), p_source_invoice_id
-      )
-      ON CONFLICT (identifier_type, identifier_key) DO NOTHING;
-    END IF;
+    INSERT INTO public.cost_supplier_identifiers (
+      supplier_id, identifier_type, identifier_key, raw_value, source_invoice_id
+    ) VALUES (
+      p_supplier_id, 'vat', v_vat_key, nullif(btrim(p_vat), ''), p_source_invoice_id
+    )
+    ON CONFLICT (identifier_type, identifier_key, supplier_id) DO NOTHING;
   END IF;
 
   v_reg_key := public.normalize_company_registration(p_company_reg);
   IF v_reg_key IS NOT NULL THEN
-    SELECT supplier_id INTO v_existing_supplier
-      FROM public.cost_supplier_identifiers
-     WHERE identifier_type = 'company_registration'
-       AND identifier_key = v_reg_key;
-    IF v_existing_supplier IS NULL OR v_existing_supplier = p_supplier_id THEN
-      INSERT INTO public.cost_supplier_identifiers (
-        supplier_id, identifier_type, identifier_key, raw_value, source_invoice_id
-      ) VALUES (
-        p_supplier_id, 'company_registration', v_reg_key, nullif(btrim(p_company_reg), ''), p_source_invoice_id
-      )
-      ON CONFLICT (identifier_type, identifier_key) DO NOTHING;
-    END IF;
+    INSERT INTO public.cost_supplier_identifiers (
+      supplier_id, identifier_type, identifier_key, raw_value, source_invoice_id
+    ) VALUES (
+      p_supplier_id, 'company_registration', v_reg_key, nullif(btrim(p_company_reg), ''), p_source_invoice_id
+    )
+    ON CONFLICT (identifier_type, identifier_key, supplier_id) DO NOTHING;
   END IF;
 
   IF p_name IS NOT NULL
@@ -4157,18 +4199,12 @@ BEGIN
      AND upper(btrim(p_name)) <> 'NA' THEN
     v_name_key := public.supplier_legal_name_key(p_name);
     IF v_name_key IS NOT NULL THEN
-      SELECT supplier_id INTO v_existing_supplier
-        FROM public.cost_supplier_identifiers
-       WHERE identifier_type = 'legal_name'
-         AND identifier_key = v_name_key;
-      IF v_existing_supplier IS NULL OR v_existing_supplier = p_supplier_id THEN
-        INSERT INTO public.cost_supplier_identifiers (
-          supplier_id, identifier_type, identifier_key, raw_value, source_invoice_id
-        ) VALUES (
-          p_supplier_id, 'legal_name', v_name_key, btrim(p_name), p_source_invoice_id
-        )
-        ON CONFLICT (identifier_type, identifier_key) DO NOTHING;
-      END IF;
+      INSERT INTO public.cost_supplier_identifiers (
+        supplier_id, identifier_type, identifier_key, raw_value, source_invoice_id
+      ) VALUES (
+        p_supplier_id, 'legal_name', v_name_key, btrim(p_name), p_source_invoice_id
+      )
+      ON CONFLICT (identifier_type, identifier_key, supplier_id) DO NOTHING;
     END IF;
   END IF;
 END;
@@ -5298,7 +5334,7 @@ ALTER TABLE ONLY "public"."cost_supplier_identifiers"
 
 
 ALTER TABLE ONLY "public"."cost_supplier_identifiers"
-    ADD CONSTRAINT "cost_supplier_identifiers_type_key_unique" UNIQUE ("identifier_type", "identifier_key");
+    ADD CONSTRAINT "cost_supplier_identifiers_type_key_supplier_unique" UNIQUE ("identifier_type", "identifier_key", "supplier_id");
 
 
 
