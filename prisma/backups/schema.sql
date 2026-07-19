@@ -70,8 +70,9 @@ CREATE TYPE "public"."app_role" AS ENUM (
     'worker',
     'manager',
     'admin',
-    'cjb_manager',
-    'super_admin'
+    'internal_manager',
+    'super_admin',
+    'cost_admin'
 );
 
 
@@ -455,10 +456,7 @@ BEGIN
   IF auth.role() IS DISTINCT FROM 'authenticated' OR auth.uid() IS NULL THEN
     RAISE EXCEPTION 'Forbidden';
   END IF;
-  IF NOT (
-    public.has_role(auth.uid(), 'admin'::public.app_role)
-    OR public.has_role(auth.uid(), 'super_admin'::public.app_role)
-  ) THEN
+  IF NOT public.has_full_admin(auth.uid()) THEN
     RAISE EXCEPTION 'Forbidden';
   END IF;
   RETURN true;
@@ -489,6 +487,33 @@ $$;
 
 
 ALTER FUNCTION "public"."assert_rpc_staff"() OWNER TO "postgres";
+
+
+CREATE OR REPLACE FUNCTION "public"."assert_rpc_submissions_browser"("p_worker_id" "uuid", "p_allowed_worker_ids" "uuid"[]) RETURNS boolean
+    LANGUAGE "plpgsql" SECURITY DEFINER
+    SET "search_path" TO 'public'
+    AS $$
+BEGIN
+  IF auth.role() = 'service_role' THEN
+    RETURN true;
+  END IF;
+  IF auth.role() IS DISTINCT FROM 'authenticated' OR auth.uid() IS NULL THEN
+    RAISE EXCEPTION 'Forbidden';
+  END IF;
+  IF public.is_staff(auth.uid()) THEN
+    RETURN true;
+  END IF;
+  IF p_worker_id IS NOT NULL
+    AND p_worker_id = auth.uid()
+    AND p_allowed_worker_ids IS NULL THEN
+    RETURN true;
+  END IF;
+  RAISE EXCEPTION 'Forbidden';
+END;
+$$;
+
+
+ALTER FUNCTION "public"."assert_rpc_submissions_browser"("p_worker_id" "uuid", "p_allowed_worker_ids" "uuid"[]) OWNER TO "postgres";
 
 
 CREATE OR REPLACE FUNCTION "public"."auto_assign_todo_list_creator"() RETURNS "trigger"
@@ -588,7 +613,7 @@ CREATE OR REPLACE FUNCTION "public"."can_access_todo_list"("_user_id" "uuid", "_
     LANGUAGE "sql" STABLE SECURITY DEFINER
     SET "search_path" TO 'public'
     AS $$
-  SELECT public.has_role(_user_id, 'super_admin'::app_role)
+  SELECT public.has_role(_user_id, 'super_admin')
   OR (
     EXISTS (
       SELECT 1 FROM public.todo_lists
@@ -607,9 +632,9 @@ CREATE OR REPLACE FUNCTION "public"."can_assign_todo_list"("_assigner_id" "uuid"
     SET "search_path" TO 'public'
     AS $$
   SELECT
-    public.has_role(_assigner_id, 'super_admin'::app_role)
+    public.has_role(_assigner_id, 'super_admin')
     OR (
-      public.has_role(_assigner_id, 'admin'::app_role)
+      public.has_role(_assigner_id, 'admin')
       AND (
         public.is_assigned_to_todo_list(_assigner_id, _list_id)
         OR EXISTS (
@@ -619,7 +644,7 @@ CREATE OR REPLACE FUNCTION "public"."can_assign_todo_list"("_assigner_id" "uuid"
       )
     )
     OR (
-      public.has_role(_assigner_id, 'cjb_manager'::app_role)
+      public.has_role(_assigner_id, 'internal_manager')
       AND (
         public.is_assigned_to_todo_list(_assigner_id, _list_id)
         OR EXISTS (
@@ -629,7 +654,7 @@ CREATE OR REPLACE FUNCTION "public"."can_assign_todo_list"("_assigner_id" "uuid"
       )
     )
     OR (
-      public.has_role(_assigner_id, 'manager'::app_role)
+      public.has_role(_assigner_id, 'manager')
       AND (
         public.is_assigned_to_todo_list(_assigner_id, _list_id)
         OR EXISTS (
@@ -642,7 +667,7 @@ CREATE OR REPLACE FUNCTION "public"."can_assign_todo_list"("_assigner_id" "uuid"
           public.user_subcontractor(_assigner_id) IS NOT NULL
           AND public.user_subcontractor(_assigner_id) = public.user_subcontractor(_target_user_id)
         )
-        OR public.has_role(_target_user_id, 'manager'::app_role)
+        OR public.has_role(_target_user_id, 'manager')
       )
     )
 $$;
@@ -672,28 +697,27 @@ CREATE OR REPLACE FUNCTION "public"."can_delete_todo_list"("_user_id" "uuid", "_
     SET "search_path" TO 'public'
     AS $$
   SELECT
-    public.has_role(_user_id, 'super_admin'::app_role)
+    public.has_role(_user_id, 'super_admin')
     OR (
-      public.has_role(_user_id, 'admin'::app_role)
+      public.has_permission(_user_id, 'todo.delete_list', false)
       AND public.is_assigned_to_todo_list(_user_id, _list_id)
-    )
-    OR (
-      public.has_role(_user_id, 'manager'::app_role)
-      AND public.is_assigned_to_todo_list(_user_id, _list_id)
-      AND public.user_subcontractor(_user_id) IS NOT NULL
-      AND EXISTS (
-        SELECT 1 FROM public.todo_list_assignments tla
-        WHERE tla.list_id = _list_id
-      )
-      AND NOT EXISTS (
-        SELECT 1
-        FROM public.todo_list_assignments tla
-        JOIN public.profiles p ON p.id = tla.user_id
-        WHERE tla.list_id = _list_id
-          AND (
-            p.subcontractor_id IS NULL
-            OR p.subcontractor_id <> public.user_subcontractor(_user_id)
+      AND (
+        public.has_role(_user_id, 'admin')
+        OR (
+          public.has_role(_user_id, 'manager')
+          AND public.user_subcontractor(_user_id) IS NOT NULL
+          AND EXISTS (SELECT 1 FROM public.todo_list_assignments tla WHERE tla.list_id = _list_id)
+          AND NOT EXISTS (
+            SELECT 1
+            FROM public.todo_list_assignments tla
+            JOIN public.profiles p ON p.id = tla.user_id
+            WHERE tla.list_id = _list_id
+              AND (
+                p.subcontractor_id IS NULL
+                OR p.subcontractor_id <> public.user_subcontractor(_user_id)
+              )
           )
+        )
       )
     )
 $$;
@@ -713,6 +737,19 @@ $$;
 
 
 ALTER FUNCTION "public"."can_manage_rams_briefing"("_briefer_id" "uuid") OWNER TO "postgres";
+
+
+CREATE OR REPLACE FUNCTION "public"."can_manage_starter"("_actor_id" "uuid", "_owner_id" "uuid") RETURNS boolean
+    LANGUAGE "sql" STABLE SECURITY DEFINER
+    SET "search_path" TO 'public'
+    AS $$
+  SELECT
+    public.can_manage_submission(_owner_id)
+    OR public.has_permission(_actor_id, 'submissions.submit_starters_on_behalf', false);
+$$;
+
+
+ALTER FUNCTION "public"."can_manage_starter"("_actor_id" "uuid", "_owner_id" "uuid") OWNER TO "postgres";
 
 
 CREATE OR REPLACE FUNCTION "public"."can_manage_submission"("_worker_id" "uuid") RETURNS boolean
@@ -741,18 +778,33 @@ CREATE OR REPLACE FUNCTION "public"."can_modify_todo_item"("_user_id" "uuid", "_
     SELECT 1
     FROM public.todo_items ti
     WHERE ti.id = _item_id
-      AND public.can_access_todo_list(_user_id, ti.list_id)
       AND (
-        public.has_role(_user_id, 'admin'::app_role)
+        public.has_role(_user_id, 'super_admin')
         OR (
-          public.has_role(_user_id, 'worker'::app_role)
-          AND ti.created_by = _user_id
-        )
-        OR (
-          public.has_role(_user_id, 'manager'::app_role)
-          AND public.user_subcontractor(_user_id) IS NOT NULL
-          AND ti.created_by IS NOT NULL
-          AND public.user_subcontractor(_user_id) = public.user_subcontractor(ti.created_by)
+          public.can_access_todo_list(_user_id, ti.list_id)
+          AND (
+            public.has_permission(_user_id, 'todo.modify_any_items', false)
+            OR (
+              public.has_role(_user_id, 'worker')
+              AND ti.created_by = _user_id
+            )
+            OR (
+              public.has_role(_user_id, 'internal_manager')
+              AND ti.created_by = _user_id
+            )
+            OR (
+              public.has_role(_user_id, 'manager')
+              AND (
+                ti.created_by = _user_id
+                OR (
+                  ti.created_by IS NOT NULL
+                  AND public.has_role(ti.created_by, 'worker')
+                  AND public.user_subcontractor(_user_id) IS NOT NULL
+                  AND public.user_subcontractor(_user_id) = public.user_subcontractor(ti.created_by)
+                )
+              )
+            )
+          )
         )
       )
   )
@@ -771,6 +823,70 @@ $$;
 
 
 ALTER FUNCTION "public"."can_submit_for"("_owner_id" "uuid") OWNER TO "postgres";
+
+
+CREATE OR REPLACE FUNCTION "public"."can_view_general_submission"("_viewer_id" "uuid", "_owner_id" "uuid") RETURNS boolean
+    LANGUAGE "sql" STABLE SECURITY DEFINER
+    SET "search_path" TO 'public'
+    AS $$
+  SELECT
+    _viewer_id = _owner_id
+    OR public.can_manage_submission(_owner_id)
+    OR public.has_permission(_viewer_id, 'submissions.view_others_forms', false);
+$$;
+
+
+ALTER FUNCTION "public"."can_view_general_submission"("_viewer_id" "uuid", "_owner_id" "uuid") OWNER TO "postgres";
+
+
+CREATE OR REPLACE FUNCTION "public"."can_view_holiday"("_viewer_id" "uuid", "_owner_id" "uuid") RETURNS boolean
+    LANGUAGE "sql" STABLE SECURITY DEFINER
+    SET "search_path" TO 'public'
+    AS $$
+  SELECT
+    _viewer_id = _owner_id
+    OR (
+      public.has_permission(_viewer_id, 'submissions.view_others_holidays', false)
+      AND (
+        public.has_permission(_viewer_id, 'data.scope_org_wide', false)
+        OR (
+          public.user_subcontractor(_viewer_id) IS NOT NULL
+          AND public.user_subcontractor(_viewer_id) = public.user_subcontractor(_owner_id)
+        )
+      )
+    );
+$$;
+
+
+ALTER FUNCTION "public"."can_view_holiday"("_viewer_id" "uuid", "_owner_id" "uuid") OWNER TO "postgres";
+
+
+CREATE OR REPLACE FUNCTION "public"."can_view_starter"("_viewer_id" "uuid", "_owner_id" "uuid") RETURNS boolean
+    LANGUAGE "sql" STABLE SECURITY DEFINER
+    SET "search_path" TO 'public'
+    AS $$
+  SELECT
+    _viewer_id = _owner_id
+    OR public.can_manage_submission(_owner_id)
+    OR public.has_permission(_viewer_id, 'submissions.view_others_starters', false);
+$$;
+
+
+ALTER FUNCTION "public"."can_view_starter"("_viewer_id" "uuid", "_owner_id" "uuid") OWNER TO "postgres";
+
+
+CREATE OR REPLACE FUNCTION "public"."can_view_timesheet"("_viewer_id" "uuid", "_worker_id" "uuid") RETURNS boolean
+    LANGUAGE "sql" STABLE SECURITY DEFINER
+    SET "search_path" TO 'public'
+    AS $$
+  SELECT
+    _viewer_id = _worker_id
+    OR public.can_manage_submission(_worker_id)
+    OR public.has_permission(_viewer_id, 'submissions.view_others_timesheets', false);
+$$;
+
+
+ALTER FUNCTION "public"."can_view_timesheet"("_viewer_id" "uuid", "_worker_id" "uuid") OWNER TO "postgres";
 
 
 CREATE OR REPLACE FUNCTION "public"."company_match_key"("p_name" "text") RETURNS "text"
@@ -1422,6 +1538,58 @@ $$;
 ALTER FUNCTION "public"."cost_invoices_set_full_field_dedupe_key_trigger"() OWNER TO "postgres";
 
 
+CREATE TABLE IF NOT EXISTS "public"."roles" (
+    "slug" "text" NOT NULL,
+    "label" "text" NOT NULL,
+    "description" "text" DEFAULT ''::"text" NOT NULL,
+    "is_system" boolean DEFAULT false NOT NULL,
+    "sort_order" integer DEFAULT 0 NOT NULL,
+    "created_at" timestamp with time zone DEFAULT "now"() NOT NULL
+);
+
+
+ALTER TABLE "public"."roles" OWNER TO "postgres";
+
+
+CREATE OR REPLACE FUNCTION "public"."create_app_role"("_slug" "text", "_label" "text", "_description" "text" DEFAULT ''::"text", "_clone_from" "text" DEFAULT NULL::"text") RETURNS "public"."roles"
+    LANGUAGE "plpgsql" SECURITY DEFINER
+    SET "search_path" TO 'public'
+    AS $_$
+DECLARE
+  v_role public.roles;
+BEGIN
+  IF _slug !~ '^[a-z][a-z0-9_]{1,48}$' THEN
+    RAISE EXCEPTION 'Role slug must be 2-49 chars: lowercase letter, then lowercase letters, digits, or underscores.';
+  END IF;
+  IF EXISTS (SELECT 1 FROM public.roles WHERE slug = _slug) THEN
+    RAISE EXCEPTION 'A role with this slug already exists.';
+  END IF;
+
+  INSERT INTO public.roles (slug, label, description, is_system, sort_order)
+  VALUES (_slug, _label, coalesce(_description, ''), false, 1000)
+  RETURNING * INTO v_role;
+
+  IF _clone_from IS NOT NULL THEN
+    INSERT INTO public.role_permissions (role, permission, granted)
+    SELECT _slug, rp.permission, rp.granted
+    FROM public.role_permissions rp
+    WHERE rp.role = _clone_from
+    ON CONFLICT (role, permission) DO NOTHING;
+  ELSE
+    INSERT INTO public.role_permissions (role, permission, granted)
+    SELECT _slug, p.key, false
+    FROM public.permissions p
+    ON CONFLICT (role, permission) DO NOTHING;
+  END IF;
+
+  RETURN v_role;
+END;
+$_$;
+
+
+ALTER FUNCTION "public"."create_app_role"("_slug" "text", "_label" "text", "_description" "text", "_clone_from" "text") OWNER TO "postgres";
+
+
 CREATE OR REPLACE FUNCTION "public"."daily_briefing_autoapprove"() RETURNS "trigger"
     LANGUAGE "plpgsql" SECURITY DEFINER
     SET "search_path" TO 'public'
@@ -1433,6 +1601,26 @@ $$;
 
 
 ALTER FUNCTION "public"."daily_briefing_autoapprove"() OWNER TO "postgres";
+
+
+CREATE OR REPLACE FUNCTION "public"."delete_app_role"("_slug" "text") RETURNS "void"
+    LANGUAGE "plpgsql" SECURITY DEFINER
+    SET "search_path" TO 'public'
+    AS $$
+BEGIN
+  IF EXISTS (SELECT 1 FROM public.roles WHERE slug = _slug AND is_system) THEN
+    RAISE EXCEPTION 'System roles cannot be deleted.';
+  END IF;
+  IF EXISTS (SELECT 1 FROM public.user_roles WHERE role = _slug) THEN
+    RAISE EXCEPTION 'Cannot delete a role that is assigned to users.';
+  END IF;
+  DELETE FROM public.role_permissions WHERE role = _slug;
+  DELETE FROM public.roles WHERE slug = _slug;
+END;
+$$;
+
+
+ALTER FUNCTION "public"."delete_app_role"("_slug" "text") OWNER TO "postgres";
 
 
 CREATE OR REPLACE FUNCTION "public"."delete_cost_payment_remittances_for_invoices"("p_invoice_ids" "uuid"[]) RETURNS integer
@@ -1670,12 +1858,13 @@ DECLARE
   v_full_name text;
   v_other_count int;
 BEGIN
-  v_username := coalesce(new.raw_user_meta_data->>'username', split_part(new.email,'@',1));
+  v_username := coalesce(new.raw_user_meta_data->>'username', split_part(new.email, '@', 1));
   v_full_name := coalesce(new.raw_user_meta_data->>'full_name', v_username);
   INSERT INTO public.profiles (id, username, full_name)
   VALUES (new.id, v_username, v_full_name)
   ON CONFLICT (id) DO NOTHING;
-  INSERT INTO public.user_roles (user_id, role) VALUES (new.id, 'worker')
+  INSERT INTO public.user_roles (user_id, role)
+  VALUES (new.id, 'worker')
   ON CONFLICT DO NOTHING;
   INSERT INTO public.notification_preferences (user_id)
   VALUES (new.id)
@@ -1688,7 +1877,7 @@ BEGIN
     FROM public.projects p
     WHERE p.archived_at IS NULL
       AND (
-        SELECT count(distinct pa.user_id)
+        SELECT count(DISTINCT pa.user_id)
         FROM public.project_assignments pa
         WHERE pa.project_id = p.id
           AND pa.user_id <> new.id
@@ -1700,7 +1889,7 @@ BEGIN
     FROM public.todo_lists tl
     WHERE tl.archived_at IS NULL
       AND (
-        SELECT count(distinct tla.user_id)
+        SELECT count(DISTINCT tla.user_id)
         FROM public.todo_list_assignments tla
         WHERE tla.list_id = tl.id
           AND tla.user_id <> new.id
@@ -1716,19 +1905,69 @@ $$;
 ALTER FUNCTION "public"."handle_new_user"() OWNER TO "postgres";
 
 
-CREATE OR REPLACE FUNCTION "public"."has_role"("_user_id" "uuid", "_role" "public"."app_role") RETURNS boolean
+CREATE OR REPLACE FUNCTION "public"."has_full_admin"("_user_id" "uuid") RETURNS boolean
     LANGUAGE "sql" STABLE SECURITY DEFINER
     SET "search_path" TO 'public'
     AS $$
-  select exists (
-    select 1 from public.user_roles
-    where user_id = _user_id
-      and (role = _role or (role = 'super_admin' and _role = 'admin'))
-  )
+  SELECT public.has_role(_user_id, 'admin') OR public.has_role(_user_id, 'super_admin');
 $$;
 
 
-ALTER FUNCTION "public"."has_role"("_user_id" "uuid", "_role" "public"."app_role") OWNER TO "postgres";
+ALTER FUNCTION "public"."has_full_admin"("_user_id" "uuid") OWNER TO "postgres";
+
+
+CREATE OR REPLACE FUNCTION "public"."has_permission"("_user_id" "uuid", "_permission" "text", "_default" boolean DEFAULT false) RETURNS boolean
+    LANGUAGE "sql" STABLE SECURITY DEFINER
+    SET "search_path" TO 'public'
+    AS $$
+  SELECT CASE
+    WHEN EXISTS (
+      SELECT 1 FROM public.user_roles WHERE user_id = _user_id AND role = 'super_admin'
+    ) THEN true
+    ELSE COALESCE(
+      (
+        SELECT bool_or(rp.granted)
+        FROM public.role_permissions rp
+        INNER JOIN public.user_roles ur ON ur.role = rp.role AND ur.user_id = _user_id
+        WHERE rp.permission = _permission
+      ),
+      _default
+    )
+  END;
+$$;
+
+
+ALTER FUNCTION "public"."has_permission"("_user_id" "uuid", "_permission" "text", "_default" boolean) OWNER TO "postgres";
+
+
+CREATE OR REPLACE FUNCTION "public"."has_role"("_user_id" "uuid", "_role" "text") RETURNS boolean
+    LANGUAGE "sql" STABLE SECURITY DEFINER
+    SET "search_path" TO 'public'
+    AS $$
+  SELECT EXISTS (
+    SELECT 1
+    FROM public.user_roles ur
+    WHERE ur.user_id = _user_id
+      AND (
+        ur.role = _role
+        OR (ur.role = 'super_admin' AND _role = 'admin')
+      )
+  );
+$$;
+
+
+ALTER FUNCTION "public"."has_role"("_user_id" "uuid", "_role" "text") OWNER TO "postgres";
+
+
+CREATE OR REPLACE FUNCTION "public"."has_role_app_role_deprecated"("_user_id" "uuid", "_role" "public"."app_role") RETURNS boolean
+    LANGUAGE "sql" STABLE SECURITY DEFINER
+    SET "search_path" TO 'public'
+    AS $$
+  SELECT public.has_role(_user_id, _role::text);
+$$;
+
+
+ALTER FUNCTION "public"."has_role_app_role_deprecated"("_user_id" "uuid", "_role" "public"."app_role") OWNER TO "postgres";
 
 
 CREATE OR REPLACE FUNCTION "public"."havs_autoapprove"() RETURNS "trigger"
@@ -2118,11 +2357,15 @@ CREATE OR REPLACE FUNCTION "public"."is_staff"("_user_id" "uuid") RETURNS boolea
     LANGUAGE "sql" STABLE SECURITY DEFINER
     SET "search_path" TO 'public'
     AS $$
-  SELECT EXISTS (
-    SELECT 1 FROM public.user_roles
-    WHERE user_id = _user_id
-      AND role IN ('manager','admin','cjb_manager','super_admin')
-  )
+  SELECT
+    public.has_role(_user_id, 'manager')
+    OR public.has_role(_user_id, 'admin')
+    OR public.has_role(_user_id, 'internal_manager')
+    OR public.has_role(_user_id, 'super_admin')
+    OR public.has_permission(_user_id, 'access.dashboard', false)
+    OR public.has_permission(_user_id, 'access.review', false)
+    OR public.has_permission(_user_id, 'access.team', false)
+    OR public.has_permission(_user_id, 'access.admin', false);
 $$;
 
 
@@ -2443,7 +2686,7 @@ CREATE OR REPLACE FUNCTION "public"."list_submissions_browser"("p_from" "date", 
     LANGUAGE "sql" STABLE SECURITY DEFINER
     SET "search_path" TO 'public'
     AS $$
-  WITH auth_guard AS (SELECT public.assert_rpc_staff() AS _), base AS (
+  WITH auth_guard AS (SELECT public.assert_rpc_submissions_browser(p_worker_id, p_allowed_worker_ids) AS _), base AS (
     SELECT
       'timesheet'::text AS kind,
       t.id,
@@ -2673,7 +2916,7 @@ CREATE OR REPLACE FUNCTION "public"."list_submissions_browser"("p_from" "date", 
     LANGUAGE "sql" STABLE SECURITY DEFINER
     SET "search_path" TO 'public'
     AS $$
-  WITH auth_guard AS (SELECT public.assert_rpc_staff() AS _), base AS (
+  WITH auth_guard AS (SELECT public.assert_rpc_submissions_browser(p_worker_id, p_allowed_worker_ids) AS _), base AS (
     SELECT
       'timesheet'::text AS kind,
       t.id,
@@ -2904,6 +3147,497 @@ $$;
 ALTER FUNCTION "public"."list_submissions_browser"("p_from" "date", "p_to" "date", "p_kinds" "text"[], "p_worker_id" "uuid", "p_group" "text", "p_client" "uuid", "p_search" "text", "p_allowed_worker_ids" "uuid"[], "p_limit" integer, "p_offset" integer, "p_sensitive_owner_id" "uuid") OWNER TO "postgres";
 
 
+CREATE OR REPLACE FUNCTION "public"."list_submissions_browser"("p_from" "date", "p_to" "date", "p_kinds" "text"[], "p_worker_id" "uuid" DEFAULT NULL::"uuid", "p_group" "text" DEFAULT NULL::"text", "p_client" "uuid" DEFAULT NULL::"uuid", "p_search" "text" DEFAULT NULL::"text", "p_allowed_worker_ids" "uuid"[] DEFAULT NULL::"uuid"[], "p_limit" integer DEFAULT 20, "p_offset" integer DEFAULT 0, "p_sensitive_owner_id" "uuid" DEFAULT NULL::"uuid", "p_sensitive_timesheet_owner_id" "uuid" DEFAULT NULL::"uuid", "p_sensitive_starter_owner_id" "uuid" DEFAULT NULL::"uuid") RETURNS TABLE("kind" "text", "id" "uuid", "worker_id" "uuid", "who" "text", "group_name" "text", "label" "text", "status" "text", "when_at" timestamp with time zone, "client_id" "uuid", "client_ids" "uuid"[], "repaired" boolean, "total_count" bigint)
+    LANGUAGE "sql" STABLE SECURITY DEFINER
+    SET "search_path" TO 'public'
+    AS $$
+  WITH base AS (
+    SELECT
+      'timesheet'::text AS kind,
+      t.id,
+      t.worker_id,
+      COALESCE(p.full_name, p.username, 'Unknown') AS who,
+      s.name AS group_name,
+      'Week ending ' || to_char(t.week_ending::date, 'DD Mon YYYY') AS label,
+      t.status::text AS status,
+      t.created_at AS when_at,
+      NULL::uuid AS client_id,
+      COALESCE((
+        SELECT array_agg(DISTINCT pr.client_id) FILTER (WHERE pr.client_id IS NOT NULL)
+        FROM public.timesheet_days td
+        JOIN public.projects pr ON pr.id = td.project_id
+        WHERE td.timesheet_id = t.id
+      ), ARRAY[]::uuid[]) AS client_ids,
+      false AS repaired
+    FROM public.timesheets t
+    LEFT JOIN public.profiles p ON p.id = t.worker_id
+    LEFT JOIN public.subcontractors s ON s.id = p.subcontractor_id
+    WHERE t.week_ending >= p_from
+      AND t.week_ending <= p_to
+      AND ('timesheet' = ANY (p_kinds))
+
+    UNION ALL
+
+    SELECT
+      'plant_inspection',
+      pi.id,
+      pi.worker_id,
+      COALESCE(p.full_name, p.username, 'Unknown'),
+      s.name,
+      'Plant: ' || COALESCE(pi.plant_description, ''),
+      pi.status::text,
+      pi.created_at,
+      pi.client_id,
+      CASE WHEN pi.client_id IS NULL THEN ARRAY[]::uuid[] ELSE ARRAY[pi.client_id] END,
+      EXISTS (
+        SELECT 1 FROM public.plant_inspection_items pii
+        WHERE pii.inspection_id = pi.id AND pii.repaired_at IS NOT NULL
+      )
+    FROM public.plant_inspections pi
+    LEFT JOIN public.profiles p ON p.id = pi.worker_id
+    LEFT JOIN public.subcontractors s ON s.id = p.subcontractor_id
+    WHERE pi.inspection_date >= p_from
+      AND pi.inspection_date <= p_to
+      AND ('plant_inspection' = ANY (p_kinds))
+
+    UNION ALL
+
+    SELECT
+      'vehicle_defect',
+      vd.id,
+      vd.worker_id,
+      COALESCE(p.full_name, p.username, 'Unknown'),
+      s.name,
+      'Vehicle: ' || COALESCE(vd.vehicle_registration, ''),
+      vd.status::text,
+      vd.created_at,
+      NULL::uuid,
+      ARRAY[]::uuid[],
+      EXISTS (
+        SELECT 1 FROM public.vehicle_defect_items vdi
+        WHERE vdi.defect_id = vd.id AND vdi.repaired_at IS NOT NULL
+      )
+    FROM public.vehicle_defects vd
+    LEFT JOIN public.profiles p ON p.id = vd.worker_id
+    LEFT JOIN public.subcontractors s ON s.id = p.subcontractor_id
+    WHERE vd.inspection_date >= p_from
+      AND vd.inspection_date <= p_to
+      AND ('vehicle_defect' = ANY (p_kinds))
+
+    UNION ALL
+
+    SELECT
+      'rams_briefing',
+      rb.id,
+      rb.briefer_id,
+      COALESCE(p.full_name, p.username, 'Unknown'),
+      s.name,
+      'RAMS: ' || COALESCE(rb.method_statement_title, ''),
+      rb.status::text,
+      rb.created_at,
+      rb.client_id,
+      CASE WHEN rb.client_id IS NULL THEN ARRAY[]::uuid[] ELSE ARRAY[rb.client_id] END,
+      false
+    FROM public.rams_briefings rb
+    LEFT JOIN public.profiles p ON p.id = rb.briefer_id
+    LEFT JOIN public.subcontractors s ON s.id = p.subcontractor_id
+    WHERE rb.briefing_date >= p_from
+      AND rb.briefing_date <= p_to
+      AND ('rams_briefing' = ANY (p_kinds))
+
+    UNION ALL
+
+    SELECT
+      'havs_log',
+      hl.id,
+      hl.worker_id,
+      COALESCE(p.full_name, p.username, 'Unknown'),
+      s.name,
+      'HAVS · ' || COALESCE(hl.total_points::text, '0') || ' pts',
+      hl.status::text,
+      hl.created_at,
+      hl.client_id,
+      CASE WHEN hl.client_id IS NULL THEN ARRAY[]::uuid[] ELSE ARRAY[hl.client_id] END,
+      false
+    FROM public.havs_logs hl
+    LEFT JOIN public.profiles p ON p.id = hl.worker_id
+    LEFT JOIN public.subcontractors s ON s.id = p.subcontractor_id
+    WHERE hl.log_date >= p_from
+      AND hl.log_date <= p_to
+      AND ('havs_log' = ANY (p_kinds))
+
+    UNION ALL
+
+    SELECT
+      'toolbox_talk',
+      tt.id,
+      tt.briefer_id,
+      COALESCE(p.full_name, p.username, 'Unknown'),
+      s.name,
+      'Toolbox: ' || COALESCE(tt.topic, ''),
+      tt.status::text,
+      tt.created_at,
+      tt.client_id,
+      CASE WHEN tt.client_id IS NULL THEN ARRAY[]::uuid[] ELSE ARRAY[tt.client_id] END,
+      false
+    FROM public.toolbox_talks tt
+    LEFT JOIN public.profiles p ON p.id = tt.briefer_id
+    LEFT JOIN public.subcontractors s ON s.id = p.subcontractor_id
+    WHERE tt.talk_date >= p_from
+      AND tt.talk_date <= p_to
+      AND ('toolbox_talk' = ANY (p_kinds))
+
+    UNION ALL
+
+    SELECT
+      'daily_briefing',
+      db.id,
+      db.briefer_id,
+      COALESCE(p.full_name, p.username, 'Unknown'),
+      s.name,
+      'Daily Briefing · ' || to_char(db.time_delivered, 'DD Mon YYYY HH24:MI'),
+      db.status::text,
+      db.created_at,
+      db.client_id,
+      CASE WHEN db.client_id IS NULL THEN ARRAY[]::uuid[] ELSE ARRAY[db.client_id] END,
+      false
+    FROM public.daily_briefings db
+    LEFT JOIN public.profiles p ON p.id = db.briefer_id
+    LEFT JOIN public.subcontractors s ON s.id = p.subcontractor_id
+    WHERE db.time_delivered >= (p_from::timestamptz)
+      AND db.time_delivered <= ((p_to::text || 'T23:59:59')::timestamptz)
+      AND ('daily_briefing' = ANY (p_kinds))
+
+    UNION ALL
+
+    SELECT
+      'starter',
+      es.id,
+      es.user_id,
+      CASE
+        WHEN es.user_id IS NULL THEN '(deleted user)'
+        ELSE COALESCE(p.full_name, p.username, 'Unknown')
+      END,
+      s.name,
+      'Starter form · ' || COALESCE(es.full_name, '') || ' (v' || COALESCE(es.revision, 1)::text || ')',
+      CASE WHEN es.submitted_at IS NOT NULL THEN 'submitted' ELSE 'draft' END,
+      COALESCE(es.submitted_at, es.created_at),
+      NULL::uuid,
+      ARRAY[]::uuid[],
+      false
+    FROM public.employee_starters es
+    LEFT JOIN public.profiles p ON p.id = es.user_id
+    LEFT JOIN public.subcontractors s ON s.id = p.subcontractor_id
+    WHERE es.created_at >= p_from::timestamptz
+      AND es.created_at <= ((p_to::text || 'T23:59:59')::timestamptz)
+      AND ('starter' = ANY (p_kinds))
+  ),
+  filtered AS (
+    SELECT *
+    FROM base b
+    WHERE (p_worker_id IS NULL OR b.worker_id = p_worker_id)
+      AND (p_allowed_worker_ids IS NULL OR b.worker_id = ANY (p_allowed_worker_ids))
+      AND (
+        b.kind <> 'timesheet'
+        OR COALESCE(p_sensitive_timesheet_owner_id, p_sensitive_owner_id) IS NULL
+        OR b.worker_id = COALESCE(p_sensitive_timesheet_owner_id, p_sensitive_owner_id)
+      )
+      AND (
+        b.kind <> 'starter'
+        OR COALESCE(p_sensitive_starter_owner_id, p_sensitive_owner_id) IS NULL
+        OR b.worker_id = COALESCE(p_sensitive_starter_owner_id, p_sensitive_owner_id)
+      )
+      AND (COALESCE(NULLIF(trim(p_group), ''), NULL) IS NULL OR b.group_name = p_group)
+      AND (
+        p_client IS NULL
+        OR (b.kind = 'timesheet' AND p_client = ANY (b.client_ids))
+        OR (b.kind <> 'timesheet' AND b.client_id = p_client)
+      )
+      AND (
+        COALESCE(NULLIF(trim(p_search), ''), NULL) IS NULL
+        OR lower(b.label || ' ' || b.who || ' ' || COALESCE(b.group_name, '')) LIKE '%' || lower(trim(p_search)) || '%'
+      )
+  ),
+  ranked AS (
+    SELECT
+      f.*,
+      count(*) OVER () AS total_count
+    FROM filtered f
+    ORDER BY f.when_at DESC
+    LIMIT GREATEST(p_limit, 0)
+    OFFSET GREATEST(p_offset, 0)
+  )
+  SELECT
+    r.kind,
+    r.id,
+    r.worker_id,
+    r.who,
+    r.group_name,
+    r.label,
+    r.status,
+    r.when_at,
+    r.client_id,
+    r.client_ids,
+    r.repaired,
+    r.total_count
+  FROM ranked r;
+$$;
+
+
+ALTER FUNCTION "public"."list_submissions_browser"("p_from" "date", "p_to" "date", "p_kinds" "text"[], "p_worker_id" "uuid", "p_group" "text", "p_client" "uuid", "p_search" "text", "p_allowed_worker_ids" "uuid"[], "p_limit" integer, "p_offset" integer, "p_sensitive_owner_id" "uuid", "p_sensitive_timesheet_owner_id" "uuid", "p_sensitive_starter_owner_id" "uuid") OWNER TO "postgres";
+
+
+CREATE OR REPLACE FUNCTION "public"."list_submissions_browser"("p_from" "date", "p_to" "date", "p_kinds" "text"[], "p_worker_id" "uuid" DEFAULT NULL::"uuid", "p_group" "text" DEFAULT NULL::"text", "p_client" "uuid" DEFAULT NULL::"uuid", "p_search" "text" DEFAULT NULL::"text", "p_allowed_worker_ids" "uuid"[] DEFAULT NULL::"uuid"[], "p_limit" integer DEFAULT 20, "p_offset" integer DEFAULT 0, "p_sensitive_owner_id" "uuid" DEFAULT NULL::"uuid", "p_sensitive_timesheet_owner_id" "uuid" DEFAULT NULL::"uuid", "p_sensitive_starter_owner_id" "uuid" DEFAULT NULL::"uuid", "p_sensitive_forms_owner_id" "uuid" DEFAULT NULL::"uuid") RETURNS TABLE("kind" "text", "id" "uuid", "worker_id" "uuid", "who" "text", "group_name" "text", "label" "text", "status" "text", "when_at" timestamp with time zone, "client_id" "uuid", "client_ids" "uuid"[], "repaired" boolean, "total_count" bigint)
+    LANGUAGE "sql" STABLE SECURITY DEFINER
+    SET "search_path" TO 'public'
+    AS $$
+  WITH auth_guard AS (
+    SELECT public.assert_rpc_submissions_browser(p_worker_id, p_allowed_worker_ids) AS _
+  ),
+  base AS (
+    SELECT
+      'timesheet'::text AS kind,
+      t.id,
+      t.worker_id,
+      COALESCE(p.full_name, p.username, 'Unknown') AS who,
+      s.name AS group_name,
+      'Week ending ' || to_char(t.week_ending::date, 'DD Mon YYYY') AS label,
+      t.status::text AS status,
+      t.created_at AS when_at,
+      NULL::uuid AS client_id,
+      COALESCE((
+        SELECT array_agg(DISTINCT pr.client_id) FILTER (WHERE pr.client_id IS NOT NULL)
+        FROM public.timesheet_days td
+        JOIN public.projects pr ON pr.id = td.project_id
+        WHERE td.timesheet_id = t.id
+      ), ARRAY[]::uuid[]) AS client_ids,
+      false AS repaired
+    FROM public.timesheets t
+    LEFT JOIN public.profiles p ON p.id = t.worker_id
+    LEFT JOIN public.subcontractors s ON s.id = p.subcontractor_id
+    WHERE t.week_ending >= p_from
+      AND t.week_ending <= p_to
+      AND ('timesheet' = ANY (p_kinds))
+
+    UNION ALL
+
+    SELECT
+      'plant_inspection',
+      pi.id,
+      pi.worker_id,
+      COALESCE(p.full_name, p.username, 'Unknown'),
+      s.name,
+      'Plant: ' || COALESCE(pi.plant_description, ''),
+      pi.status::text,
+      pi.created_at,
+      pi.client_id,
+      CASE WHEN pi.client_id IS NULL THEN ARRAY[]::uuid[] ELSE ARRAY[pi.client_id] END,
+      EXISTS (
+        SELECT 1 FROM public.plant_inspection_items pii
+        WHERE pii.inspection_id = pi.id AND pii.repaired_at IS NOT NULL
+      )
+    FROM public.plant_inspections pi
+    LEFT JOIN public.profiles p ON p.id = pi.worker_id
+    LEFT JOIN public.subcontractors s ON s.id = p.subcontractor_id
+    WHERE pi.inspection_date >= p_from
+      AND pi.inspection_date <= p_to
+      AND ('plant_inspection' = ANY (p_kinds))
+
+    UNION ALL
+
+    SELECT
+      'vehicle_defect',
+      vd.id,
+      vd.worker_id,
+      COALESCE(p.full_name, p.username, 'Unknown'),
+      s.name,
+      'Vehicle: ' || COALESCE(vd.vehicle_registration, ''),
+      vd.status::text,
+      vd.created_at,
+      NULL::uuid,
+      ARRAY[]::uuid[],
+      EXISTS (
+        SELECT 1 FROM public.vehicle_defect_items vdi
+        WHERE vdi.defect_id = vd.id AND vdi.repaired_at IS NOT NULL
+      )
+    FROM public.vehicle_defects vd
+    LEFT JOIN public.profiles p ON p.id = vd.worker_id
+    LEFT JOIN public.subcontractors s ON s.id = p.subcontractor_id
+    WHERE vd.inspection_date >= p_from
+      AND vd.inspection_date <= p_to
+      AND ('vehicle_defect' = ANY (p_kinds))
+
+    UNION ALL
+
+    SELECT
+      'rams_briefing',
+      rb.id,
+      rb.briefer_id,
+      COALESCE(p.full_name, p.username, 'Unknown'),
+      s.name,
+      'RAMS: ' || COALESCE(rb.method_statement_title, ''),
+      rb.status::text,
+      rb.created_at,
+      rb.client_id,
+      CASE WHEN rb.client_id IS NULL THEN ARRAY[]::uuid[] ELSE ARRAY[rb.client_id] END,
+      false
+    FROM public.rams_briefings rb
+    LEFT JOIN public.profiles p ON p.id = rb.briefer_id
+    LEFT JOIN public.subcontractors s ON s.id = p.subcontractor_id
+    WHERE rb.briefing_date >= p_from
+      AND rb.briefing_date <= p_to
+      AND ('rams_briefing' = ANY (p_kinds))
+
+    UNION ALL
+
+    SELECT
+      'havs_log',
+      hl.id,
+      hl.worker_id,
+      COALESCE(p.full_name, p.username, 'Unknown'),
+      s.name,
+      'HAVS · ' || COALESCE(hl.total_points::text, '0') || ' pts',
+      hl.status::text,
+      hl.created_at,
+      hl.client_id,
+      CASE WHEN hl.client_id IS NULL THEN ARRAY[]::uuid[] ELSE ARRAY[hl.client_id] END,
+      false
+    FROM public.havs_logs hl
+    LEFT JOIN public.profiles p ON p.id = hl.worker_id
+    LEFT JOIN public.subcontractors s ON s.id = p.subcontractor_id
+    WHERE hl.log_date >= p_from
+      AND hl.log_date <= p_to
+      AND ('havs_log' = ANY (p_kinds))
+
+    UNION ALL
+
+    SELECT
+      'toolbox_talk',
+      tt.id,
+      tt.briefer_id,
+      COALESCE(p.full_name, p.username, 'Unknown'),
+      s.name,
+      'Toolbox: ' || COALESCE(tt.topic, ''),
+      tt.status::text,
+      tt.created_at,
+      tt.client_id,
+      CASE WHEN tt.client_id IS NULL THEN ARRAY[]::uuid[] ELSE ARRAY[tt.client_id] END,
+      false
+    FROM public.toolbox_talks tt
+    LEFT JOIN public.profiles p ON p.id = tt.briefer_id
+    LEFT JOIN public.subcontractors s ON s.id = p.subcontractor_id
+    WHERE tt.talk_date >= p_from
+      AND tt.talk_date <= p_to
+      AND ('toolbox_talk' = ANY (p_kinds))
+
+    UNION ALL
+
+    SELECT
+      'daily_briefing',
+      db.id,
+      db.briefer_id,
+      COALESCE(p.full_name, p.username, 'Unknown'),
+      s.name,
+      'Daily Briefing · ' || to_char(db.time_delivered, 'DD Mon YYYY HH24:MI'),
+      db.status::text,
+      db.created_at,
+      db.client_id,
+      CASE WHEN db.client_id IS NULL THEN ARRAY[]::uuid[] ELSE ARRAY[db.client_id] END,
+      false
+    FROM public.daily_briefings db
+    LEFT JOIN public.profiles p ON p.id = db.briefer_id
+    LEFT JOIN public.subcontractors s ON s.id = p.subcontractor_id
+    WHERE db.time_delivered >= (p_from::timestamptz)
+      AND db.time_delivered <= ((p_to::text || 'T23:59:59')::timestamptz)
+      AND ('daily_briefing' = ANY (p_kinds))
+
+    UNION ALL
+
+    SELECT
+      'starter',
+      es.id,
+      es.user_id,
+      CASE
+        WHEN es.user_id IS NULL THEN '(deleted user)'
+        ELSE COALESCE(p.full_name, p.username, 'Unknown')
+      END,
+      s.name,
+      'Starter form · ' || COALESCE(es.full_name, '') || ' (v' || COALESCE(es.revision, 1)::text || ')',
+      CASE WHEN es.submitted_at IS NOT NULL THEN 'submitted' ELSE 'draft' END,
+      COALESCE(es.submitted_at, es.created_at),
+      NULL::uuid,
+      ARRAY[]::uuid[],
+      false
+    FROM public.employee_starters es
+    LEFT JOIN public.profiles p ON p.id = es.user_id
+    LEFT JOIN public.subcontractors s ON s.id = p.subcontractor_id
+    WHERE es.created_at >= p_from::timestamptz
+      AND es.created_at <= ((p_to::text || 'T23:59:59')::timestamptz)
+      AND ('starter' = ANY (p_kinds))
+  ),
+  filtered AS (
+    SELECT *
+    FROM base b
+    WHERE (p_worker_id IS NULL OR b.worker_id = p_worker_id)
+      AND (p_allowed_worker_ids IS NULL OR b.worker_id = ANY (p_allowed_worker_ids))
+      AND (
+        b.kind <> 'timesheet'
+        OR COALESCE(p_sensitive_timesheet_owner_id, p_sensitive_owner_id) IS NULL
+        OR b.worker_id = COALESCE(p_sensitive_timesheet_owner_id, p_sensitive_owner_id)
+      )
+      AND (
+        b.kind <> 'starter'
+        OR COALESCE(p_sensitive_starter_owner_id, p_sensitive_owner_id) IS NULL
+        OR b.worker_id = COALESCE(p_sensitive_starter_owner_id, p_sensitive_owner_id)
+      )
+      AND (
+        b.kind NOT IN (
+          'plant_inspection', 'vehicle_defect', 'rams_briefing',
+          'havs_log', 'toolbox_talk', 'daily_briefing'
+        )
+        OR COALESCE(p_sensitive_forms_owner_id, p_sensitive_owner_id) IS NULL
+        OR b.worker_id = COALESCE(p_sensitive_forms_owner_id, p_sensitive_owner_id)
+      )
+      AND (COALESCE(NULLIF(trim(p_group), ''), NULL) IS NULL OR b.group_name = p_group)
+      AND (
+        p_client IS NULL
+        OR (b.kind = 'timesheet' AND p_client = ANY (b.client_ids))
+        OR (b.kind <> 'timesheet' AND b.client_id = p_client)
+      )
+      AND (
+        COALESCE(NULLIF(trim(p_search), ''), NULL) IS NULL
+        OR lower(b.label || ' ' || b.who || ' ' || COALESCE(b.group_name, '')) LIKE '%' || lower(trim(p_search)) || '%'
+      )
+  ),
+  ranked AS (
+    SELECT
+      f.*,
+      count(*) OVER () AS total_count
+    FROM filtered f
+    ORDER BY f.when_at DESC
+    LIMIT GREATEST(p_limit, 0)
+    OFFSET GREATEST(p_offset, 0)
+  )
+  SELECT
+    r.kind,
+    r.id,
+    r.worker_id,
+    r.who,
+    r.group_name,
+    r.label,
+    r.status,
+    r.when_at,
+    r.client_id,
+    r.client_ids,
+    r.repaired,
+    r.total_count
+  FROM ranked r;
+$$;
+
+
+ALTER FUNCTION "public"."list_submissions_browser"("p_from" "date", "p_to" "date", "p_kinds" "text"[], "p_worker_id" "uuid", "p_group" "text", "p_client" "uuid", "p_search" "text", "p_allowed_worker_ids" "uuid"[], "p_limit" integer, "p_offset" integer, "p_sensitive_owner_id" "uuid", "p_sensitive_timesheet_owner_id" "uuid", "p_sensitive_starter_owner_id" "uuid", "p_sensitive_forms_owner_id" "uuid") OWNER TO "postgres";
+
+
 CREATE OR REPLACE FUNCTION "public"."lookup_cost_supplier_by_identifiers"("p_vat" "text", "p_company_reg" "text", "p_name" "text") RETURNS TABLE("supplier_id" "uuid", "canonical_name" "text")
     LANGUAGE "plpgsql" STABLE SECURITY DEFINER
     SET "search_path" TO 'public'
@@ -3114,6 +3848,20 @@ $$;
 
 
 ALTER FUNCTION "public"."match_subcontractor_by_company"("p_company" "text") OWNER TO "postgres";
+
+
+CREATE OR REPLACE FUNCTION "public"."migration_export_auth_users"() RETURNS "jsonb"
+    LANGUAGE "sql" SECURITY DEFINER
+    SET "search_path" TO 'auth', 'public'
+    AS $$
+  SELECT jsonb_build_object(
+    'users', COALESCE((SELECT jsonb_agg(row_to_json(u)) FROM auth.users u), '[]'::jsonb),
+    'identities', COALESCE((SELECT jsonb_agg(row_to_json(i)) FROM auth.identities i), '[]'::jsonb)
+  );
+$$;
+
+
+ALTER FUNCTION "public"."migration_export_auth_users"() OWNER TO "postgres";
 
 
 CREATE OR REPLACE FUNCTION "public"."most_common_cost_company_name"("p_match_key" "text") RETURNS "text"
@@ -4846,6 +5594,18 @@ CREATE TABLE IF NOT EXISTS "public"."password_recovery_tokens" (
 ALTER TABLE "public"."password_recovery_tokens" OWNER TO "postgres";
 
 
+CREATE TABLE IF NOT EXISTS "public"."permissions" (
+    "key" "text" NOT NULL,
+    "label" "text" NOT NULL,
+    "description" "text" NOT NULL,
+    "category" "text" DEFAULT 'general'::"text" NOT NULL,
+    "sort_order" integer DEFAULT 0 NOT NULL
+);
+
+
+ALTER TABLE "public"."permissions" OWNER TO "postgres";
+
+
 CREATE TABLE IF NOT EXISTS "public"."plant" (
     "id" "uuid" DEFAULT "gen_random_uuid"() NOT NULL,
     "description" "text" NOT NULL,
@@ -5002,6 +5762,18 @@ CREATE TABLE IF NOT EXISTS "public"."rams_briefings" (
 
 
 ALTER TABLE "public"."rams_briefings" OWNER TO "postgres";
+
+
+CREATE TABLE IF NOT EXISTS "public"."role_permissions" (
+    "role" "text" NOT NULL,
+    "permission" "text" NOT NULL,
+    "granted" boolean DEFAULT false NOT NULL,
+    "updated_at" timestamp with time zone DEFAULT "now"() NOT NULL,
+    "updated_by" "uuid"
+);
+
+
+ALTER TABLE "public"."role_permissions" OWNER TO "postgres";
 
 
 CREATE TABLE IF NOT EXISTS "public"."subcontractors" (
@@ -5204,7 +5976,7 @@ ALTER TABLE "public"."user_notifications" OWNER TO "postgres";
 CREATE TABLE IF NOT EXISTS "public"."user_roles" (
     "id" "uuid" DEFAULT "gen_random_uuid"() NOT NULL,
     "user_id" "uuid" NOT NULL,
-    "role" "public"."app_role" NOT NULL
+    "role" "text" DEFAULT 'worker'::"public"."app_role" NOT NULL
 );
 
 ALTER TABLE ONLY "public"."user_roles" REPLICA IDENTITY FULL;
@@ -5520,6 +6292,11 @@ ALTER TABLE ONLY "public"."password_recovery_tokens"
 
 
 
+ALTER TABLE ONLY "public"."permissions"
+    ADD CONSTRAINT "permissions_pkey" PRIMARY KEY ("key");
+
+
+
 ALTER TABLE ONLY "public"."plant_inspection_items"
     ADD CONSTRAINT "plant_inspection_items_pkey" PRIMARY KEY ("id");
 
@@ -5587,6 +6364,16 @@ ALTER TABLE ONLY "public"."rams_attendees"
 
 ALTER TABLE ONLY "public"."rams_briefings"
     ADD CONSTRAINT "rams_briefings_pkey" PRIMARY KEY ("id");
+
+
+
+ALTER TABLE ONLY "public"."role_permissions"
+    ADD CONSTRAINT "role_permissions_pkey" PRIMARY KEY ("role", "permission");
+
+
+
+ALTER TABLE ONLY "public"."roles"
+    ADD CONSTRAINT "roles_pkey" PRIMARY KEY ("slug");
 
 
 
@@ -6436,6 +7223,21 @@ ALTER TABLE ONLY "public"."rams_briefings"
 
 
 
+ALTER TABLE ONLY "public"."role_permissions"
+    ADD CONSTRAINT "role_permissions_permission_fkey" FOREIGN KEY ("permission") REFERENCES "public"."permissions"("key") ON DELETE CASCADE;
+
+
+
+ALTER TABLE ONLY "public"."role_permissions"
+    ADD CONSTRAINT "role_permissions_role_fkey" FOREIGN KEY ("role") REFERENCES "public"."roles"("slug") ON UPDATE CASCADE ON DELETE CASCADE;
+
+
+
+ALTER TABLE ONLY "public"."role_permissions"
+    ADD CONSTRAINT "role_permissions_updated_by_fkey" FOREIGN KEY ("updated_by") REFERENCES "auth"."users"("id") ON DELETE SET NULL;
+
+
+
 ALTER TABLE ONLY "public"."timesheet_days"
     ADD CONSTRAINT "timesheet_days_project_id_fkey" FOREIGN KEY ("project_id") REFERENCES "public"."projects"("id") ON DELETE SET NULL;
 
@@ -6567,6 +7369,11 @@ ALTER TABLE ONLY "public"."user_notifications"
 
 
 ALTER TABLE ONLY "public"."user_roles"
+    ADD CONSTRAINT "user_roles_role_fkey" FOREIGN KEY ("role") REFERENCES "public"."roles"("slug") ON UPDATE CASCADE ON DELETE RESTRICT;
+
+
+
+ALTER TABLE ONLY "public"."user_roles"
     ADD CONSTRAINT "user_roles_user_id_fkey" FOREIGN KEY ("user_id") REFERENCES "auth"."users"("id") ON DELETE CASCADE;
 
 
@@ -6611,83 +7418,83 @@ ALTER TABLE ONLY "public"."vehicle_defects"
 
 
 
-CREATE POLICY "Admins can delete havs_tools" ON "public"."havs_tools" FOR DELETE TO "authenticated" USING ("public"."has_role"("auth"."uid"(), 'admin'::"public"."app_role"));
+CREATE POLICY "Admins can delete havs_tools" ON "public"."havs_tools" FOR DELETE TO "authenticated" USING ("public"."has_role_app_role_deprecated"("auth"."uid"(), 'admin'::"public"."app_role"));
 
 
 
-CREATE POLICY "Admins can insert havs_tools" ON "public"."havs_tools" FOR INSERT TO "authenticated" WITH CHECK ("public"."has_role"("auth"."uid"(), 'admin'::"public"."app_role"));
+CREATE POLICY "Admins can insert havs_tools" ON "public"."havs_tools" FOR INSERT TO "authenticated" WITH CHECK ("public"."has_role_app_role_deprecated"("auth"."uid"(), 'admin'::"public"."app_role"));
 
 
 
-CREATE POLICY "Admins can read dated scans" ON "public"."cost_dated_scans" FOR SELECT TO "authenticated" USING (("public"."has_role"("auth"."uid"(), 'admin'::"public"."app_role") OR "public"."has_role"("auth"."uid"(), 'super_admin'::"public"."app_role")));
+CREATE POLICY "Admins can read dated scans" ON "public"."cost_dated_scans" FOR SELECT TO "authenticated" USING ("public"."has_permission"("auth"."uid"(), 'access.costs'::"text", false));
 
 
 
-CREATE POLICY "Admins can update havs_tools" ON "public"."havs_tools" FOR UPDATE TO "authenticated" USING ("public"."has_role"("auth"."uid"(), 'admin'::"public"."app_role")) WITH CHECK ("public"."has_role"("auth"."uid"(), 'admin'::"public"."app_role"));
+CREATE POLICY "Admins can update havs_tools" ON "public"."havs_tools" FOR UPDATE TO "authenticated" USING ("public"."has_role_app_role_deprecated"("auth"."uid"(), 'admin'::"public"."app_role")) WITH CHECK ("public"."has_role_app_role_deprecated"("auth"."uid"(), 'admin'::"public"."app_role"));
 
 
 
-CREATE POLICY "Admins delete cost invoices" ON "public"."cost_invoices" FOR DELETE TO "authenticated" USING (("public"."has_role"("auth"."uid"(), 'admin'::"public"."app_role") OR "public"."has_role"("auth"."uid"(), 'super_admin'::"public"."app_role")));
+CREATE POLICY "Admins delete cost invoices" ON "public"."cost_invoices" FOR DELETE TO "authenticated" USING ("public"."has_permission"("auth"."uid"(), 'access.costs'::"text", false));
 
 
 
-CREATE POLICY "Admins delete cost payment remittances" ON "public"."cost_payment_remittances" FOR DELETE TO "authenticated" USING ("public"."has_role"("auth"."uid"(), 'admin'::"public"."app_role"));
+CREATE POLICY "Admins delete cost payment remittances" ON "public"."cost_payment_remittances" FOR DELETE TO "authenticated" USING ("public"."has_permission"("auth"."uid"(), 'access.costs'::"text", false));
 
 
 
-CREATE POLICY "Admins insert app settings" ON "public"."app_settings" FOR INSERT TO "authenticated" WITH CHECK ("public"."has_role"("auth"."uid"(), 'admin'::"public"."app_role"));
+CREATE POLICY "Admins insert app settings" ON "public"."app_settings" FOR INSERT TO "authenticated" WITH CHECK ("public"."has_role_app_role_deprecated"("auth"."uid"(), 'admin'::"public"."app_role"));
 
 
 
-CREATE POLICY "Admins manage cost company aliases" ON "public"."cost_company_aliases" TO "authenticated" USING (("public"."has_role"("auth"."uid"(), 'admin'::"public"."app_role") OR "public"."has_role"("auth"."uid"(), 'super_admin'::"public"."app_role"))) WITH CHECK (("public"."has_role"("auth"."uid"(), 'admin'::"public"."app_role") OR "public"."has_role"("auth"."uid"(), 'super_admin'::"public"."app_role")));
+CREATE POLICY "Admins manage cost company aliases" ON "public"."cost_company_aliases" TO "authenticated" USING ("public"."has_permission"("auth"."uid"(), 'access.costs'::"text", false)) WITH CHECK ("public"."has_permission"("auth"."uid"(), 'access.costs'::"text", false));
 
 
 
-CREATE POLICY "Admins manage cost company brand aliases" ON "public"."cost_company_brand_aliases" TO "authenticated" USING (("public"."has_role"("auth"."uid"(), 'admin'::"public"."app_role") OR "public"."has_role"("auth"."uid"(), 'super_admin'::"public"."app_role"))) WITH CHECK (("public"."has_role"("auth"."uid"(), 'admin'::"public"."app_role") OR "public"."has_role"("auth"."uid"(), 'super_admin'::"public"."app_role")));
+CREATE POLICY "Admins manage cost company brand aliases" ON "public"."cost_company_brand_aliases" TO "authenticated" USING ("public"."has_permission"("auth"."uid"(), 'access.costs'::"text", false)) WITH CHECK ("public"."has_permission"("auth"."uid"(), 'access.costs'::"text", false));
 
 
 
-CREATE POLICY "Admins manage cost company domain aliases" ON "public"."cost_company_domain_aliases" TO "authenticated" USING (("public"."has_role"("auth"."uid"(), 'admin'::"public"."app_role") OR "public"."has_role"("auth"."uid"(), 'super_admin'::"public"."app_role"))) WITH CHECK (("public"."has_role"("auth"."uid"(), 'admin'::"public"."app_role") OR "public"."has_role"("auth"."uid"(), 'super_admin'::"public"."app_role")));
+CREATE POLICY "Admins manage cost company domain aliases" ON "public"."cost_company_domain_aliases" TO "authenticated" USING ("public"."has_permission"("auth"."uid"(), 'access.costs'::"text", false)) WITH CHECK ("public"."has_permission"("auth"."uid"(), 'access.costs'::"text", false));
 
 
 
-CREATE POLICY "Admins manage cost_supplier_identifiers" ON "public"."cost_supplier_identifiers" TO "authenticated" USING ("public"."has_role"("auth"."uid"(), 'admin'::"public"."app_role")) WITH CHECK ("public"."has_role"("auth"."uid"(), 'admin'::"public"."app_role"));
+CREATE POLICY "Admins manage cost_supplier_identifiers" ON "public"."cost_supplier_identifiers" TO "authenticated" USING ("public"."has_permission"("auth"."uid"(), 'access.costs'::"text", false)) WITH CHECK ("public"."has_permission"("auth"."uid"(), 'access.costs'::"text", false));
 
 
 
-CREATE POLICY "Admins manage cost_suppliers" ON "public"."cost_suppliers" TO "authenticated" USING ("public"."has_role"("auth"."uid"(), 'admin'::"public"."app_role")) WITH CHECK ("public"."has_role"("auth"."uid"(), 'admin'::"public"."app_role"));
+CREATE POLICY "Admins manage cost_suppliers" ON "public"."cost_suppliers" TO "authenticated" USING ("public"."has_permission"("auth"."uid"(), 'access.costs'::"text", false)) WITH CHECK ("public"."has_permission"("auth"."uid"(), 'access.costs'::"text", false));
 
 
 
-CREATE POLICY "Admins read cost invoices" ON "public"."cost_invoices" FOR SELECT TO "authenticated" USING (("public"."has_role"("auth"."uid"(), 'admin'::"public"."app_role") OR "public"."has_role"("auth"."uid"(), 'super_admin'::"public"."app_role")));
+CREATE POLICY "Admins read cost invoices" ON "public"."cost_invoices" FOR SELECT TO "authenticated" USING ("public"."has_permission"("auth"."uid"(), 'access.costs'::"text", false));
 
 
 
-CREATE POLICY "Admins read cost payment remittances" ON "public"."cost_payment_remittances" FOR SELECT TO "authenticated" USING ("public"."has_role"("auth"."uid"(), 'admin'::"public"."app_role"));
+CREATE POLICY "Admins read cost payment remittances" ON "public"."cost_payment_remittances" FOR SELECT TO "authenticated" USING ("public"."has_permission"("auth"."uid"(), 'access.costs'::"text", false));
 
 
 
-CREATE POLICY "Admins read cost_scan_skips" ON "public"."cost_scan_skips" FOR SELECT TO "authenticated" USING (("public"."has_role"("auth"."uid"(), 'admin'::"public"."app_role") OR "public"."has_role"("auth"."uid"(), 'super_admin'::"public"."app_role")));
+CREATE POLICY "Admins read cost_scan_skips" ON "public"."cost_scan_skips" FOR SELECT TO "authenticated" USING ("public"."has_permission"("auth"."uid"(), 'access.costs'::"text", false));
 
 
 
-CREATE POLICY "Admins read cost_skip_attachments" ON "public"."cost_skip_attachments" FOR SELECT TO "authenticated" USING (("public"."has_role"("auth"."uid"(), 'admin'::"public"."app_role") OR "public"."has_role"("auth"."uid"(), 'super_admin'::"public"."app_role")));
+CREATE POLICY "Admins read cost_skip_attachments" ON "public"."cost_skip_attachments" FOR SELECT TO "authenticated" USING ("public"."has_permission"("auth"."uid"(), 'access.costs'::"text", false));
 
 
 
-CREATE POLICY "Admins read scan state" ON "public"."cost_scan_state" FOR SELECT TO "authenticated" USING (("public"."has_role"("auth"."uid"(), 'admin'::"public"."app_role") OR "public"."has_role"("auth"."uid"(), 'super_admin'::"public"."app_role")));
+CREATE POLICY "Admins read scan state" ON "public"."cost_scan_state" FOR SELECT TO "authenticated" USING ("public"."has_permission"("auth"."uid"(), 'access.costs'::"text", false));
 
 
 
-CREATE POLICY "Admins update app settings" ON "public"."app_settings" FOR UPDATE TO "authenticated" USING ("public"."has_role"("auth"."uid"(), 'admin'::"public"."app_role")) WITH CHECK ("public"."has_role"("auth"."uid"(), 'admin'::"public"."app_role"));
+CREATE POLICY "Admins update app settings" ON "public"."app_settings" FOR UPDATE TO "authenticated" USING ("public"."has_role_app_role_deprecated"("auth"."uid"(), 'admin'::"public"."app_role")) WITH CHECK ("public"."has_role_app_role_deprecated"("auth"."uid"(), 'admin'::"public"."app_role"));
 
 
 
-CREATE POLICY "Admins update cost invoices" ON "public"."cost_invoices" FOR UPDATE TO "authenticated" USING (("public"."has_role"("auth"."uid"(), 'admin'::"public"."app_role") OR "public"."has_role"("auth"."uid"(), 'super_admin'::"public"."app_role"))) WITH CHECK (("public"."has_role"("auth"."uid"(), 'admin'::"public"."app_role") OR "public"."has_role"("auth"."uid"(), 'super_admin'::"public"."app_role")));
+CREATE POLICY "Admins update cost invoices" ON "public"."cost_invoices" FOR UPDATE TO "authenticated" USING ("public"."has_permission"("auth"."uid"(), 'access.costs'::"text", false)) WITH CHECK ("public"."has_permission"("auth"."uid"(), 'access.costs'::"text", false));
 
 
 
-CREATE POLICY "Admins update scan state" ON "public"."cost_scan_state" FOR UPDATE TO "authenticated" USING (("public"."has_role"("auth"."uid"(), 'admin'::"public"."app_role") OR "public"."has_role"("auth"."uid"(), 'super_admin'::"public"."app_role"))) WITH CHECK (("public"."has_role"("auth"."uid"(), 'admin'::"public"."app_role") OR "public"."has_role"("auth"."uid"(), 'super_admin'::"public"."app_role")));
+CREATE POLICY "Admins update scan state" ON "public"."cost_scan_state" FOR UPDATE TO "authenticated" USING ("public"."has_permission"("auth"."uid"(), 'access.costs'::"text", false)) WITH CHECK ("public"."has_permission"("auth"."uid"(), 'access.costs'::"text", false));
 
 
 
@@ -6699,7 +7506,7 @@ CREATE POLICY "Authenticated read app settings" ON "public"."app_settings" FOR S
 
 
 
-CREATE POLICY "Insert holidays for self or managed worker" ON "public"."holidays" FOR INSERT TO "authenticated" WITH CHECK ((("user_id" = "auth"."uid"()) OR "public"."has_role"("auth"."uid"(), 'admin'::"public"."app_role") OR ("public"."has_role"("auth"."uid"(), 'manager'::"public"."app_role") AND (NOT "public"."is_staff"("user_id")) AND ("public"."user_subcontractor"("auth"."uid"()) IS NOT NULL) AND ("public"."user_subcontractor"("auth"."uid"()) = "public"."user_subcontractor"("user_id")))));
+CREATE POLICY "Insert holidays for self or managed worker" ON "public"."holidays" FOR INSERT TO "authenticated" WITH CHECK ((("user_id" = "auth"."uid"()) OR "public"."has_role_app_role_deprecated"("auth"."uid"(), 'admin'::"public"."app_role") OR ("public"."has_role_app_role_deprecated"("auth"."uid"(), 'manager'::"public"."app_role") AND (NOT "public"."is_staff"("user_id")) AND ("public"."user_subcontractor"("auth"."uid"()) IS NOT NULL) AND ("public"."user_subcontractor"("auth"."uid"()) = "public"."user_subcontractor"("user_id")))));
 
 
 
@@ -6707,11 +7514,11 @@ CREATE POLICY "No direct client access" ON "public"."password_recovery_tokens" T
 
 
 
-CREATE POLICY "Owner admin or manager delete holidays" ON "public"."holidays" FOR DELETE TO "authenticated" USING (("public"."has_role"("auth"."uid"(), 'admin'::"public"."app_role") OR (("end_date" >= CURRENT_DATE) AND (("user_id" = "auth"."uid"()) OR ("public"."has_role"("auth"."uid"(), 'manager'::"public"."app_role") AND (NOT "public"."is_staff"("user_id")) AND ("public"."user_subcontractor"("auth"."uid"()) IS NOT NULL) AND ("public"."user_subcontractor"("auth"."uid"()) = "public"."user_subcontractor"("user_id")))))));
+CREATE POLICY "Owner admin or manager delete holidays" ON "public"."holidays" FOR DELETE TO "authenticated" USING (("public"."has_role_app_role_deprecated"("auth"."uid"(), 'admin'::"public"."app_role") OR (("end_date" >= CURRENT_DATE) AND (("user_id" = "auth"."uid"()) OR ("public"."has_role_app_role_deprecated"("auth"."uid"(), 'manager'::"public"."app_role") AND (NOT "public"."is_staff"("user_id")) AND ("public"."user_subcontractor"("auth"."uid"()) IS NOT NULL) AND ("public"."user_subcontractor"("auth"."uid"()) = "public"."user_subcontractor"("user_id")))))));
 
 
 
-CREATE POLICY "Owner admin or manager update holidays" ON "public"."holidays" FOR UPDATE TO "authenticated" USING (("public"."has_role"("auth"."uid"(), 'admin'::"public"."app_role") OR (("end_date" >= CURRENT_DATE) AND (("user_id" = "auth"."uid"()) OR ("public"."has_role"("auth"."uid"(), 'manager'::"public"."app_role") AND (NOT "public"."is_staff"("user_id")) AND ("public"."user_subcontractor"("auth"."uid"()) IS NOT NULL) AND ("public"."user_subcontractor"("auth"."uid"()) = "public"."user_subcontractor"("user_id"))))))) WITH CHECK (("public"."has_role"("auth"."uid"(), 'admin'::"public"."app_role") OR (("end_date" >= CURRENT_DATE) AND (("user_id" = "auth"."uid"()) OR ("public"."has_role"("auth"."uid"(), 'manager'::"public"."app_role") AND (NOT "public"."is_staff"("user_id")) AND ("public"."user_subcontractor"("auth"."uid"()) IS NOT NULL) AND ("public"."user_subcontractor"("auth"."uid"()) = "public"."user_subcontractor"("user_id")))))));
+CREATE POLICY "Owner admin or manager update holidays" ON "public"."holidays" FOR UPDATE TO "authenticated" USING (("public"."has_role_app_role_deprecated"("auth"."uid"(), 'admin'::"public"."app_role") OR (("end_date" >= CURRENT_DATE) AND (("user_id" = "auth"."uid"()) OR ("public"."has_role_app_role_deprecated"("auth"."uid"(), 'manager'::"public"."app_role") AND (NOT "public"."is_staff"("user_id")) AND ("public"."user_subcontractor"("auth"."uid"()) IS NOT NULL) AND ("public"."user_subcontractor"("auth"."uid"()) = "public"."user_subcontractor"("user_id"))))))) WITH CHECK (("public"."has_role_app_role_deprecated"("auth"."uid"(), 'admin'::"public"."app_role") OR (("end_date" >= CURRENT_DATE) AND (("user_id" = "auth"."uid"()) OR ("public"."has_role_app_role_deprecated"("auth"."uid"(), 'manager'::"public"."app_role") AND (NOT "public"."is_staff"("user_id")) AND ("public"."user_subcontractor"("auth"."uid"()) IS NOT NULL) AND ("public"."user_subcontractor"("auth"."uid"()) = "public"."user_subcontractor"("user_id")))))));
 
 
 
@@ -6719,37 +7526,29 @@ CREATE POLICY "Staff can view NAS sync queue" ON "public"."nas_sync_queue" FOR S
 
 
 
-CREATE POLICY "Staff oversight view holidays" ON "public"."holidays" FOR SELECT TO "authenticated" USING (("public"."has_role"("auth"."uid"(), 'admin'::"public"."app_role") OR "public"."has_role"("auth"."uid"(), 'cjb_manager'::"public"."app_role") OR ("public"."has_role"("auth"."uid"(), 'manager'::"public"."app_role") AND ("public"."user_subcontractor"("auth"."uid"()) IS NOT NULL) AND ("public"."user_subcontractor"("auth"."uid"()) = "public"."user_subcontractor"("user_id")))));
-
-
-
-CREATE POLICY "Users view own holidays" ON "public"."holidays" FOR SELECT TO "authenticated" USING (("user_id" = "auth"."uid"()));
-
-
-
 ALTER TABLE "public"."app_settings" ENABLE ROW LEVEL SECURITY;
 
 
-CREATE POLICY "assignments admin write" ON "public"."project_assignments" TO "authenticated" USING ("public"."has_role"("auth"."uid"(), 'admin'::"public"."app_role")) WITH CHECK ("public"."has_role"("auth"."uid"(), 'admin'::"public"."app_role"));
+CREATE POLICY "assignments admin write" ON "public"."project_assignments" TO "authenticated" USING ("public"."has_role_app_role_deprecated"("auth"."uid"(), 'admin'::"public"."app_role")) WITH CHECK ("public"."has_role_app_role_deprecated"("auth"."uid"(), 'admin'::"public"."app_role"));
 
 
 
-CREATE POLICY "assignments manager delete" ON "public"."project_assignments" FOR DELETE TO "authenticated" USING (("public"."has_role"("auth"."uid"(), 'manager'::"public"."app_role") AND "public"."is_assigned_to_project"("auth"."uid"(), "project_id") AND ("public"."user_subcontractor"("auth"."uid"()) IS NOT NULL) AND ("public"."user_subcontractor"("auth"."uid"()) = "public"."user_subcontractor"("user_id"))));
+CREATE POLICY "assignments manager delete" ON "public"."project_assignments" FOR DELETE TO "authenticated" USING (("public"."has_role_app_role_deprecated"("auth"."uid"(), 'manager'::"public"."app_role") AND "public"."is_assigned_to_project"("auth"."uid"(), "project_id") AND ("public"."user_subcontractor"("auth"."uid"()) IS NOT NULL) AND ("public"."user_subcontractor"("auth"."uid"()) = "public"."user_subcontractor"("user_id"))));
 
 
 
-CREATE POLICY "assignments manager insert" ON "public"."project_assignments" FOR INSERT TO "authenticated" WITH CHECK (("public"."has_role"("auth"."uid"(), 'manager'::"public"."app_role") AND "public"."is_assigned_to_project"("auth"."uid"(), "project_id") AND ("public"."user_subcontractor"("auth"."uid"()) IS NOT NULL) AND ("public"."user_subcontractor"("auth"."uid"()) = "public"."user_subcontractor"("user_id"))));
+CREATE POLICY "assignments manager insert" ON "public"."project_assignments" FOR INSERT TO "authenticated" WITH CHECK (("public"."has_role_app_role_deprecated"("auth"."uid"(), 'manager'::"public"."app_role") AND "public"."is_assigned_to_project"("auth"."uid"(), "project_id") AND ("public"."user_subcontractor"("auth"."uid"()) IS NOT NULL) AND ("public"."user_subcontractor"("auth"."uid"()) = "public"."user_subcontractor"("user_id"))));
 
 
 
-CREATE POLICY "assignments read" ON "public"."project_assignments" FOR SELECT TO "authenticated" USING ((("user_id" = "auth"."uid"()) OR "public"."has_role"("auth"."uid"(), 'admin'::"public"."app_role") OR ("public"."has_role"("auth"."uid"(), 'manager'::"public"."app_role") AND "public"."is_assigned_to_project"("auth"."uid"(), "project_id"))));
+CREATE POLICY "assignments read" ON "public"."project_assignments" FOR SELECT TO "authenticated" USING ((("user_id" = "auth"."uid"()) OR "public"."has_role_app_role_deprecated"("auth"."uid"(), 'admin'::"public"."app_role") OR ("public"."has_role_app_role_deprecated"("auth"."uid"(), 'manager'::"public"."app_role") AND "public"."is_assigned_to_project"("auth"."uid"(), "project_id"))));
 
 
 
 ALTER TABLE "public"."clients" ENABLE ROW LEVEL SECURITY;
 
 
-CREATE POLICY "clients admin write" ON "public"."clients" TO "authenticated" USING ("public"."has_role"("auth"."uid"(), 'admin'::"public"."app_role")) WITH CHECK ("public"."has_role"("auth"."uid"(), 'admin'::"public"."app_role"));
+CREATE POLICY "clients admin write" ON "public"."clients" TO "authenticated" USING ("public"."has_permission"("auth"."uid"(), 'access.admin'::"text", false)) WITH CHECK ("public"."has_permission"("auth"."uid"(), 'access.admin'::"text", false));
 
 
 
@@ -6769,7 +7568,7 @@ ALTER TABLE "public"."cost_company_domain_aliases" ENABLE ROW LEVEL SECURITY;
 ALTER TABLE "public"."cost_company_subcontractors" ENABLE ROW LEVEL SECURITY;
 
 
-CREATE POLICY "cost_company_subcontractors admin all" ON "public"."cost_company_subcontractors" TO "authenticated" USING (("public"."has_role"("auth"."uid"(), 'admin'::"public"."app_role") OR "public"."has_role"("auth"."uid"(), 'super_admin'::"public"."app_role"))) WITH CHECK (("public"."has_role"("auth"."uid"(), 'admin'::"public"."app_role") OR "public"."has_role"("auth"."uid"(), 'super_admin'::"public"."app_role")));
+CREATE POLICY "cost_company_subcontractors admin all" ON "public"."cost_company_subcontractors" TO "authenticated" USING ("public"."has_permission"("auth"."uid"(), 'access.costs'::"text", false)) WITH CHECK ("public"."has_permission"("auth"."uid"(), 'access.costs'::"text", false));
 
 
 
@@ -6779,7 +7578,7 @@ ALTER TABLE "public"."cost_dated_scans" ENABLE ROW LEVEL SECURITY;
 ALTER TABLE "public"."cost_invoice_splits" ENABLE ROW LEVEL SECURITY;
 
 
-CREATE POLICY "cost_invoice_splits admin all" ON "public"."cost_invoice_splits" TO "authenticated" USING (("public"."has_role"("auth"."uid"(), 'admin'::"public"."app_role") OR "public"."has_role"("auth"."uid"(), 'super_admin'::"public"."app_role"))) WITH CHECK (("public"."has_role"("auth"."uid"(), 'admin'::"public"."app_role") OR "public"."has_role"("auth"."uid"(), 'super_admin'::"public"."app_role")));
+CREATE POLICY "cost_invoice_splits admin all" ON "public"."cost_invoice_splits" TO "authenticated" USING ("public"."has_permission"("auth"."uid"(), 'access.costs'::"text", false)) WITH CHECK ("public"."has_permission"("auth"."uid"(), 'access.costs'::"text", false));
 
 
 
@@ -6813,7 +7612,7 @@ ALTER TABLE "public"."daily_briefing_hazards" ENABLE ROW LEVEL SECURITY;
 ALTER TABLE "public"."daily_briefings" ENABLE ROW LEVEL SECURITY;
 
 
-CREATE POLICY "db admin delete" ON "public"."daily_briefings" FOR DELETE TO "authenticated" USING ("public"."has_role"("auth"."uid"(), 'admin'::"public"."app_role"));
+CREATE POLICY "db admin delete" ON "public"."daily_briefings" FOR DELETE TO "authenticated" USING ("public"."has_role_app_role_deprecated"("auth"."uid"(), 'admin'::"public"."app_role"));
 
 
 
@@ -6821,7 +7620,7 @@ CREATE POLICY "db assigned read" ON "public"."daily_briefings" FOR SELECT TO "au
 
 
 
-CREATE POLICY "db cjb_manager read" ON "public"."daily_briefings" FOR SELECT TO "authenticated" USING ("public"."has_role"("auth"."uid"(), 'cjb_manager'::"public"."app_role"));
+CREATE POLICY "db internal_manager read" ON "public"."daily_briefings" FOR SELECT TO "authenticated" USING ("public"."has_role_app_role_deprecated"("auth"."uid"(), 'internal_manager'::"public"."app_role"));
 
 
 
@@ -6833,7 +7632,7 @@ CREATE POLICY "db owner update" ON "public"."daily_briefings" FOR UPDATE TO "aut
 
 
 
-CREATE POLICY "db read scope" ON "public"."daily_briefings" FOR SELECT TO "authenticated" USING ("public"."can_manage_submission"("briefer_id"));
+CREATE POLICY "db read scope" ON "public"."daily_briefings" FOR SELECT TO "authenticated" USING (("public"."can_view_general_submission"("auth"."uid"(), "briefer_id") OR "public"."has_role"("auth"."uid"(), 'internal_manager'::"text")));
 
 
 
@@ -6872,7 +7671,7 @@ CREATE POLICY "db_haz read" ON "public"."daily_briefing_hazards" FOR SELECT TO "
 ALTER TABLE "public"."employee_pay" ENABLE ROW LEVEL SECURITY;
 
 
-CREATE POLICY "employee_pay admin all" ON "public"."employee_pay" TO "authenticated" USING ("public"."has_role"("auth"."uid"(), 'admin'::"public"."app_role")) WITH CHECK ("public"."has_role"("auth"."uid"(), 'admin'::"public"."app_role"));
+CREATE POLICY "employee_pay admin all" ON "public"."employee_pay" TO "authenticated" USING (("public"."has_permission"("auth"."uid"(), 'access.shift_rates'::"text", false) AND "public"."has_permission"("auth"."uid"(), 'financials.view'::"text", false))) WITH CHECK (("public"."has_permission"("auth"."uid"(), 'access.shift_rates'::"text", false) AND "public"."has_permission"("auth"."uid"(), 'financials.view'::"text", false)));
 
 
 
@@ -6880,10 +7679,6 @@ ALTER TABLE "public"."employee_starters" ENABLE ROW LEVEL SECURITY;
 
 
 CREATE POLICY "havs assigned read" ON "public"."havs_logs" FOR SELECT TO "authenticated" USING ((("project_id" IS NOT NULL) AND "public"."is_assigned_to_project"("auth"."uid"(), "project_id")));
-
-
-
-CREATE POLICY "havs cjb_manager read" ON "public"."havs_logs" FOR SELECT TO "authenticated" USING ("public"."has_role"("auth"."uid"(), 'cjb_manager'::"public"."app_role"));
 
 
 
@@ -6895,7 +7690,11 @@ CREATE POLICY "havs insert self or admin on behalf" ON "public"."havs_logs" FOR 
 
 
 
-CREATE POLICY "havs select self or staff scope" ON "public"."havs_logs" FOR SELECT TO "authenticated" USING ("public"."can_manage_submission"("worker_id"));
+CREATE POLICY "havs internal_manager read" ON "public"."havs_logs" FOR SELECT TO "authenticated" USING ("public"."has_role_app_role_deprecated"("auth"."uid"(), 'internal_manager'::"public"."app_role"));
+
+
+
+CREATE POLICY "havs read scope" ON "public"."havs_logs" FOR SELECT TO "authenticated" USING (("public"."can_view_general_submission"("auth"."uid"(), "worker_id") OR "public"."has_role"("auth"."uid"(), 'internal_manager'::"text")));
 
 
 
@@ -6903,7 +7702,7 @@ CREATE POLICY "havs update self or staff scope" ON "public"."havs_logs" FOR UPDA
 
 
 
-CREATE POLICY "havs_items cjb_manager read" ON "public"."havs_log_items" FOR SELECT TO "authenticated" USING ("public"."has_role"("auth"."uid"(), 'cjb_manager'::"public"."app_role"));
+CREATE POLICY "havs_items internal_manager read" ON "public"."havs_log_items" FOR SELECT TO "authenticated" USING ("public"."has_role_app_role_deprecated"("auth"."uid"(), 'internal_manager'::"public"."app_role"));
 
 
 
@@ -6915,9 +7714,9 @@ CREATE POLICY "havs_items read" ON "public"."havs_log_items" FOR SELECT TO "auth
 
 CREATE POLICY "havs_items write" ON "public"."havs_log_items" TO "authenticated" USING ((EXISTS ( SELECT 1
    FROM "public"."havs_logs" "h"
-  WHERE (("h"."id" = "havs_log_items"."log_id") AND "public"."can_manage_submission"("h"."worker_id") AND (("h"."status" = 'submitted'::"public"."submission_status") OR "public"."has_role"("auth"."uid"(), 'admin'::"public"."app_role")))))) WITH CHECK ((EXISTS ( SELECT 1
+  WHERE (("h"."id" = "havs_log_items"."log_id") AND "public"."can_manage_submission"("h"."worker_id") AND (("h"."status" = 'submitted'::"public"."submission_status") OR "public"."has_role_app_role_deprecated"("auth"."uid"(), 'admin'::"public"."app_role")))))) WITH CHECK ((EXISTS ( SELECT 1
    FROM "public"."havs_logs" "h"
-  WHERE (("h"."id" = "havs_log_items"."log_id") AND "public"."can_manage_submission"("h"."worker_id") AND (("h"."status" = 'submitted'::"public"."submission_status") OR "public"."has_role"("auth"."uid"(), 'admin'::"public"."app_role"))))));
+  WHERE (("h"."id" = "havs_log_items"."log_id") AND "public"."can_manage_submission"("h"."worker_id") AND (("h"."status" = 'submitted'::"public"."submission_status") OR "public"."has_role_app_role_deprecated"("auth"."uid"(), 'admin'::"public"."app_role"))))));
 
 
 
@@ -6933,6 +7732,10 @@ ALTER TABLE "public"."havs_tools" ENABLE ROW LEVEL SECURITY;
 ALTER TABLE "public"."holidays" ENABLE ROW LEVEL SECURITY;
 
 
+CREATE POLICY "holidays read scope" ON "public"."holidays" FOR SELECT TO "authenticated" USING ("public"."can_view_holiday"("auth"."uid"(), "user_id"));
+
+
+
 ALTER TABLE "public"."integration_email_accounts" ENABLE ROW LEVEL SECURITY;
 
 
@@ -6945,21 +7748,21 @@ ALTER TABLE "public"."integration_storage_backends" ENABLE ROW LEVEL SECURITY;
 ALTER TABLE "public"."invoice_clients" ENABLE ROW LEVEL SECURITY;
 
 
-CREATE POLICY "invoice_clients admin all" ON "public"."invoice_clients" TO "authenticated" USING ("public"."has_role"("auth"."uid"(), 'admin'::"public"."app_role")) WITH CHECK ("public"."has_role"("auth"."uid"(), 'admin'::"public"."app_role"));
+CREATE POLICY "invoice_clients admin all" ON "public"."invoice_clients" TO "authenticated" USING ("public"."has_permission"("auth"."uid"(), 'access.invoices'::"text", false)) WITH CHECK ("public"."has_permission"("auth"."uid"(), 'access.invoices'::"text", false));
 
 
 
 ALTER TABLE "public"."invoice_lines" ENABLE ROW LEVEL SECURITY;
 
 
-CREATE POLICY "invoice_lines admin all" ON "public"."invoice_lines" TO "authenticated" USING ("public"."has_role"("auth"."uid"(), 'admin'::"public"."app_role")) WITH CHECK ("public"."has_role"("auth"."uid"(), 'admin'::"public"."app_role"));
+CREATE POLICY "invoice_lines admin all" ON "public"."invoice_lines" TO "authenticated" USING ("public"."has_permission"("auth"."uid"(), 'access.invoices'::"text", false)) WITH CHECK ("public"."has_permission"("auth"."uid"(), 'access.invoices'::"text", false));
 
 
 
 ALTER TABLE "public"."invoices" ENABLE ROW LEVEL SECURITY;
 
 
-CREATE POLICY "invoices admin all" ON "public"."invoices" TO "authenticated" USING ("public"."has_role"("auth"."uid"(), 'admin'::"public"."app_role")) WITH CHECK ("public"."has_role"("auth"."uid"(), 'admin'::"public"."app_role"));
+CREATE POLICY "invoices admin all" ON "public"."invoices" TO "authenticated" USING ("public"."has_permission"("auth"."uid"(), 'access.invoices'::"text", false)) WITH CHECK ("public"."has_permission"("auth"."uid"(), 'access.invoices'::"text", false));
 
 
 
@@ -6996,11 +7799,11 @@ CREATE POLICY "pi assigned read" ON "public"."plant_inspections" FOR SELECT TO "
 
 
 
-CREATE POLICY "pi cjb_manager read" ON "public"."plant_inspections" FOR SELECT TO "authenticated" USING ("public"."has_role"("auth"."uid"(), 'cjb_manager'::"public"."app_role"));
-
-
-
 CREATE POLICY "pi delete admin or manager scope" ON "public"."plant_inspections" FOR DELETE TO "authenticated" USING ("public"."can_manage_submission"("worker_id"));
+
+
+
+CREATE POLICY "pi internal_manager read" ON "public"."plant_inspections" FOR SELECT TO "authenticated" USING ("public"."has_role_app_role_deprecated"("auth"."uid"(), 'internal_manager'::"public"."app_role"));
 
 
 
@@ -7012,7 +7815,7 @@ CREATE POLICY "pi owner insert" ON "public"."plant_inspections" FOR INSERT TO "a
 
 
 
-CREATE POLICY "pi read scope" ON "public"."plant_inspections" FOR SELECT TO "authenticated" USING ("public"."can_manage_submission"("worker_id"));
+CREATE POLICY "pi read scope" ON "public"."plant_inspections" FOR SELECT TO "authenticated" USING (("public"."can_view_general_submission"("auth"."uid"(), "worker_id") OR "public"."has_role"("auth"."uid"(), 'internal_manager'::"text")));
 
 
 
@@ -7033,7 +7836,7 @@ CREATE POLICY "pi_items read" ON "public"."plant_inspection_items" FOR SELECT TO
 ALTER TABLE "public"."plant" ENABLE ROW LEVEL SECURITY;
 
 
-CREATE POLICY "plant admin write" ON "public"."plant" TO "authenticated" USING ("public"."has_role"("auth"."uid"(), 'admin'::"public"."app_role")) WITH CHECK ("public"."has_role"("auth"."uid"(), 'admin'::"public"."app_role"));
+CREATE POLICY "plant admin write" ON "public"."plant" TO "authenticated" USING ("public"."has_permission"("auth"."uid"(), 'access.admin'::"text", false)) WITH CHECK ("public"."has_permission"("auth"."uid"(), 'access.admin'::"text", false));
 
 
 
@@ -7050,7 +7853,7 @@ ALTER TABLE "public"."plant_inspections" ENABLE ROW LEVEL SECURITY;
 ALTER TABLE "public"."profiles" ENABLE ROW LEVEL SECURITY;
 
 
-CREATE POLICY "profiles admin all" ON "public"."profiles" TO "authenticated" USING ("public"."has_role"("auth"."uid"(), 'admin'::"public"."app_role")) WITH CHECK ("public"."has_role"("auth"."uid"(), 'admin'::"public"."app_role"));
+CREATE POLICY "profiles admin all" ON "public"."profiles" TO "authenticated" USING ("public"."has_role_app_role_deprecated"("auth"."uid"(), 'admin'::"public"."app_role")) WITH CHECK ("public"."has_role_app_role_deprecated"("auth"."uid"(), 'admin'::"public"."app_role"));
 
 
 
@@ -7068,15 +7871,15 @@ ALTER TABLE "public"."project_assignments" ENABLE ROW LEVEL SECURITY;
 ALTER TABLE "public"."projects" ENABLE ROW LEVEL SECURITY;
 
 
-CREATE POLICY "projects admin update" ON "public"."projects" FOR UPDATE TO "authenticated" USING ("public"."has_role"("auth"."uid"(), 'admin'::"public"."app_role")) WITH CHECK ("public"."has_role"("auth"."uid"(), 'admin'::"public"."app_role"));
+CREATE POLICY "projects admin update" ON "public"."projects" FOR UPDATE TO "authenticated" USING ("public"."has_permission"("auth"."uid"(), 'access.admin'::"text", false)) WITH CHECK ("public"."has_permission"("auth"."uid"(), 'access.admin'::"text", false));
 
 
 
-CREATE POLICY "projects admin write" ON "public"."projects" TO "authenticated" USING ("public"."has_role"("auth"."uid"(), 'admin'::"public"."app_role")) WITH CHECK ("public"."has_role"("auth"."uid"(), 'admin'::"public"."app_role"));
+CREATE POLICY "projects admin write" ON "public"."projects" TO "authenticated" USING ("public"."has_permission"("auth"."uid"(), 'access.admin'::"text", false)) WITH CHECK ("public"."has_permission"("auth"."uid"(), 'access.admin'::"text", false));
 
 
 
-CREATE POLICY "projects read" ON "public"."projects" FOR SELECT TO "authenticated" USING (("public"."has_role"("auth"."uid"(), 'admin'::"public"."app_role") OR "public"."has_role"("auth"."uid"(), 'cjb_manager'::"public"."app_role") OR ("archived_at" IS NULL)));
+CREATE POLICY "projects read" ON "public"."projects" FOR SELECT TO "authenticated" USING (("public"."has_role_app_role_deprecated"("auth"."uid"(), 'admin'::"public"."app_role") OR "public"."has_role_app_role_deprecated"("auth"."uid"(), 'internal_manager'::"public"."app_role") OR ("archived_at" IS NULL)));
 
 
 
@@ -7099,11 +7902,11 @@ CREATE POLICY "rams assigned read" ON "public"."rams_briefings" FOR SELECT TO "a
 
 
 
-CREATE POLICY "rams cjb_manager read" ON "public"."rams_briefings" FOR SELECT TO "authenticated" USING ("public"."has_role"("auth"."uid"(), 'cjb_manager'::"public"."app_role"));
-
-
-
 CREATE POLICY "rams delete admin or manager scope" ON "public"."rams_briefings" FOR DELETE TO "authenticated" USING ("public"."can_manage_submission"("briefer_id"));
+
+
+
+CREATE POLICY "rams internal_manager read" ON "public"."rams_briefings" FOR SELECT TO "authenticated" USING ("public"."has_role_app_role_deprecated"("auth"."uid"(), 'internal_manager'::"public"."app_role"));
 
 
 
@@ -7119,7 +7922,7 @@ CREATE POLICY "rams owner insert" ON "public"."rams_briefings" FOR INSERT TO "au
 
 
 
-CREATE POLICY "rams read scope" ON "public"."rams_briefings" FOR SELECT TO "authenticated" USING ("public"."can_manage_submission"("briefer_id"));
+CREATE POLICY "rams read scope" ON "public"."rams_briefings" FOR SELECT TO "authenticated" USING (("public"."can_view_general_submission"("auth"."uid"(), "briefer_id") OR "public"."has_role"("auth"."uid"(), 'internal_manager'::"text")));
 
 
 
@@ -7143,6 +7946,28 @@ ALTER TABLE "public"."rams_attendees" ENABLE ROW LEVEL SECURITY;
 ALTER TABLE "public"."rams_briefings" ENABLE ROW LEVEL SECURITY;
 
 
+ALTER TABLE "public"."role_permissions" ENABLE ROW LEVEL SECURITY;
+
+
+CREATE POLICY "role_permissions_select_admin" ON "public"."role_permissions" FOR SELECT USING ("public"."has_full_admin"("auth"."uid"()));
+
+
+
+CREATE POLICY "role_permissions_write_admin" ON "public"."role_permissions" USING ("public"."has_full_admin"("auth"."uid"())) WITH CHECK ("public"."has_full_admin"("auth"."uid"()));
+
+
+
+ALTER TABLE "public"."roles" ENABLE ROW LEVEL SECURITY;
+
+
+CREATE POLICY "roles read authed" ON "public"."roles" FOR SELECT TO "authenticated" USING (true);
+
+
+
+CREATE POLICY "roles write permissions admin" ON "public"."roles" TO "authenticated" USING ("public"."has_permission"("auth"."uid"(), 'admin.permissions'::"text", false)) WITH CHECK ("public"."has_permission"("auth"."uid"(), 'admin.permissions'::"text", false));
+
+
+
 CREATE POLICY "starter delete admin or manager scope" ON "public"."employee_starters" FOR DELETE TO "authenticated" USING ("public"."can_manage_submission"("user_id"));
 
 
@@ -7151,18 +7976,22 @@ CREATE POLICY "starter insert (self or admin on behalf)" ON "public"."employee_s
 
 
 
-CREATE POLICY "starter read scope" ON "public"."employee_starters" FOR SELECT TO "authenticated" USING ("public"."can_manage_submission"("user_id"));
+CREATE POLICY "starter insert (self or manager scope)" ON "public"."employee_starters" FOR INSERT TO "authenticated" WITH CHECK ("public"."can_manage_starter"("auth"."uid"(), "user_id"));
 
 
 
-CREATE POLICY "starter update (self or manager scope)" ON "public"."employee_starters" FOR UPDATE TO "authenticated" USING ("public"."can_manage_submission"("user_id")) WITH CHECK ("public"."can_manage_submission"("user_id"));
+CREATE POLICY "starter read scope" ON "public"."employee_starters" FOR SELECT TO "authenticated" USING ("public"."can_view_starter"("auth"."uid"(), "user_id"));
+
+
+
+CREATE POLICY "starter update (self or manager scope)" ON "public"."employee_starters" FOR UPDATE TO "authenticated" USING ("public"."can_manage_starter"("auth"."uid"(), "user_id")) WITH CHECK ("public"."can_manage_starter"("auth"."uid"(), "user_id"));
 
 
 
 ALTER TABLE "public"."subcontractors" ENABLE ROW LEVEL SECURITY;
 
 
-CREATE POLICY "subcontractors admin write" ON "public"."subcontractors" TO "authenticated" USING ("public"."has_role"("auth"."uid"(), 'admin'::"public"."app_role")) WITH CHECK ("public"."has_role"("auth"."uid"(), 'admin'::"public"."app_role"));
+CREATE POLICY "subcontractors admin write" ON "public"."subcontractors" TO "authenticated" USING ("public"."has_permission"("auth"."uid"(), 'access.admin'::"text", false)) WITH CHECK ("public"."has_permission"("auth"."uid"(), 'access.admin'::"text", false));
 
 
 
@@ -7173,23 +8002,23 @@ CREATE POLICY "subcontractors read" ON "public"."subcontractors" FOR SELECT TO "
 ALTER TABLE "public"."submission_photos" ENABLE ROW LEVEL SECURITY;
 
 
-CREATE POLICY "super_admin manage email accounts" ON "public"."integration_email_accounts" TO "authenticated" USING ("public"."has_role"("auth"."uid"(), 'super_admin'::"public"."app_role")) WITH CHECK ("public"."has_role"("auth"."uid"(), 'super_admin'::"public"."app_role"));
+CREATE POLICY "super_admin manage email accounts" ON "public"."integration_email_accounts" TO "authenticated" USING ("public"."has_role_app_role_deprecated"("auth"."uid"(), 'super_admin'::"public"."app_role")) WITH CHECK ("public"."has_role_app_role_deprecated"("auth"."uid"(), 'super_admin'::"public"."app_role"));
 
 
 
-CREATE POLICY "super_admin manage oauth providers" ON "public"."integration_oauth_providers" TO "authenticated" USING ("public"."has_role"("auth"."uid"(), 'super_admin'::"public"."app_role")) WITH CHECK ("public"."has_role"("auth"."uid"(), 'super_admin'::"public"."app_role"));
+CREATE POLICY "super_admin manage oauth providers" ON "public"."integration_oauth_providers" TO "authenticated" USING ("public"."has_role_app_role_deprecated"("auth"."uid"(), 'super_admin'::"public"."app_role")) WITH CHECK ("public"."has_role_app_role_deprecated"("auth"."uid"(), 'super_admin'::"public"."app_role"));
 
 
 
-CREATE POLICY "super_admin manage storage backends" ON "public"."integration_storage_backends" TO "authenticated" USING ("public"."has_role"("auth"."uid"(), 'super_admin'::"public"."app_role")) WITH CHECK ("public"."has_role"("auth"."uid"(), 'super_admin'::"public"."app_role"));
+CREATE POLICY "super_admin manage storage backends" ON "public"."integration_storage_backends" TO "authenticated" USING ("public"."has_role_app_role_deprecated"("auth"."uid"(), 'super_admin'::"public"."app_role")) WITH CHECK ("public"."has_role_app_role_deprecated"("auth"."uid"(), 'super_admin'::"public"."app_role"));
 
 
 
-CREATE POLICY "super_admin manage website contact email" ON "public"."website_contact_email_account" TO "authenticated" USING ("public"."has_role"("auth"."uid"(), 'super_admin'::"public"."app_role")) WITH CHECK ("public"."has_role"("auth"."uid"(), 'super_admin'::"public"."app_role"));
+CREATE POLICY "super_admin manage website contact email" ON "public"."website_contact_email_account" TO "authenticated" USING ("public"."has_role_app_role_deprecated"("auth"."uid"(), 'super_admin'::"public"."app_role")) WITH CHECK ("public"."has_role_app_role_deprecated"("auth"."uid"(), 'super_admin'::"public"."app_role"));
 
 
 
-CREATE POLICY "tbx admin delete" ON "public"."toolbox_talks" FOR DELETE TO "authenticated" USING ("public"."has_role"("auth"."uid"(), 'admin'::"public"."app_role"));
+CREATE POLICY "tbx admin delete" ON "public"."toolbox_talks" FOR DELETE TO "authenticated" USING ("public"."has_role_app_role_deprecated"("auth"."uid"(), 'admin'::"public"."app_role"));
 
 
 
@@ -7197,7 +8026,7 @@ CREATE POLICY "tbx assigned read" ON "public"."toolbox_talks" FOR SELECT TO "aut
 
 
 
-CREATE POLICY "tbx cjb_manager read" ON "public"."toolbox_talks" FOR SELECT TO "authenticated" USING ("public"."has_role"("auth"."uid"(), 'cjb_manager'::"public"."app_role"));
+CREATE POLICY "tbx internal_manager read" ON "public"."toolbox_talks" FOR SELECT TO "authenticated" USING ("public"."has_role_app_role_deprecated"("auth"."uid"(), 'internal_manager'::"public"."app_role"));
 
 
 
@@ -7209,7 +8038,7 @@ CREATE POLICY "tbx owner update" ON "public"."toolbox_talks" FOR UPDATE TO "auth
 
 
 
-CREATE POLICY "tbx read scope" ON "public"."toolbox_talks" FOR SELECT TO "authenticated" USING ("public"."can_manage_submission"("briefer_id"));
+CREATE POLICY "tbx read scope" ON "public"."toolbox_talks" FOR SELECT TO "authenticated" USING (("public"."can_view_general_submission"("auth"."uid"(), "briefer_id") OR "public"."has_role"("auth"."uid"(), 'internal_manager'::"text")));
 
 
 
@@ -7236,9 +8065,9 @@ ALTER TABLE "public"."timesheet_days" ENABLE ROW LEVEL SECURITY;
 
 CREATE POLICY "timesheet_days owner write unapproved" ON "public"."timesheet_days" TO "authenticated" USING ((EXISTS ( SELECT 1
    FROM "public"."timesheets" "t"
-  WHERE (("t"."id" = "timesheet_days"."timesheet_id") AND ("public"."has_role"("auth"."uid"(), 'admin'::"public"."app_role") OR (("t"."worker_id" = "auth"."uid"()) AND (("t"."status" <> 'approved'::"public"."submission_status") OR "public"."is_staff"("auth"."uid"()) OR ("t"."change_requested_at" IS NOT NULL))) OR ("public"."has_role"("auth"."uid"(), 'manager'::"public"."app_role") AND ("public"."user_subcontractor"("auth"."uid"()) IS NOT NULL) AND ("public"."user_subcontractor"("auth"."uid"()) = "public"."user_subcontractor"("t"."worker_id")))))))) WITH CHECK ((EXISTS ( SELECT 1
+  WHERE (("t"."id" = "timesheet_days"."timesheet_id") AND ("public"."has_role_app_role_deprecated"("auth"."uid"(), 'admin'::"public"."app_role") OR (("t"."worker_id" = "auth"."uid"()) AND (("t"."status" <> 'approved'::"public"."submission_status") OR "public"."is_staff"("auth"."uid"()) OR ("t"."change_requested_at" IS NOT NULL))) OR ("public"."has_role_app_role_deprecated"("auth"."uid"(), 'manager'::"public"."app_role") AND ("public"."user_subcontractor"("auth"."uid"()) IS NOT NULL) AND ("public"."user_subcontractor"("auth"."uid"()) = "public"."user_subcontractor"("t"."worker_id")))))))) WITH CHECK ((EXISTS ( SELECT 1
    FROM "public"."timesheets" "t"
-  WHERE (("t"."id" = "timesheet_days"."timesheet_id") AND ("public"."has_role"("auth"."uid"(), 'admin'::"public"."app_role") OR (("t"."worker_id" = "auth"."uid"()) AND (("t"."status" <> 'approved'::"public"."submission_status") OR "public"."is_staff"("auth"."uid"()) OR ("t"."change_requested_at" IS NOT NULL))) OR ("public"."has_role"("auth"."uid"(), 'manager'::"public"."app_role") AND ("public"."user_subcontractor"("auth"."uid"()) IS NOT NULL) AND ("public"."user_subcontractor"("auth"."uid"()) = "public"."user_subcontractor"("t"."worker_id"))))))));
+  WHERE (("t"."id" = "timesheet_days"."timesheet_id") AND ("public"."has_role_app_role_deprecated"("auth"."uid"(), 'admin'::"public"."app_role") OR (("t"."worker_id" = "auth"."uid"()) AND (("t"."status" <> 'approved'::"public"."submission_status") OR "public"."is_staff"("auth"."uid"()) OR ("t"."change_requested_at" IS NOT NULL))) OR ("public"."has_role_app_role_deprecated"("auth"."uid"(), 'manager'::"public"."app_role") AND ("public"."user_subcontractor"("auth"."uid"()) IS NOT NULL) AND ("public"."user_subcontractor"("auth"."uid"()) = "public"."user_subcontractor"("t"."worker_id"))))))));
 
 
 
@@ -7251,23 +8080,23 @@ CREATE POLICY "timesheet_days read" ON "public"."timesheet_days" FOR SELECT TO "
 ALTER TABLE "public"."timesheets" ENABLE ROW LEVEL SECURITY;
 
 
-CREATE POLICY "timesheets delete admin owner-unapproved or manager scope" ON "public"."timesheets" FOR DELETE TO "authenticated" USING (("public"."has_role"("auth"."uid"(), 'admin'::"public"."app_role") OR (("worker_id" = "auth"."uid"()) AND ("status" <> 'approved'::"public"."submission_status")) OR ("public"."has_role"("auth"."uid"(), 'manager'::"public"."app_role") AND (NOT "public"."is_staff"("worker_id")) AND ("public"."user_subcontractor"("auth"."uid"()) IS NOT NULL) AND ("public"."user_subcontractor"("auth"."uid"()) = "public"."user_subcontractor"("worker_id")))));
+CREATE POLICY "timesheets delete admin owner-unapproved or manager scope" ON "public"."timesheets" FOR DELETE TO "authenticated" USING (("public"."has_role_app_role_deprecated"("auth"."uid"(), 'admin'::"public"."app_role") OR (("worker_id" = "auth"."uid"()) AND ("status" <> 'approved'::"public"."submission_status")) OR ("public"."has_role_app_role_deprecated"("auth"."uid"(), 'manager'::"public"."app_role") AND (NOT "public"."is_staff"("worker_id")) AND ("public"."user_subcontractor"("auth"."uid"()) IS NOT NULL) AND ("public"."user_subcontractor"("auth"."uid"()) = "public"."user_subcontractor"("worker_id")))));
 
 
 
-CREATE POLICY "timesheets insert owner or manager scope" ON "public"."timesheets" FOR INSERT TO "authenticated" WITH CHECK (("public"."can_submit_for"("worker_id") OR ("public"."has_role"("auth"."uid"(), 'manager'::"public"."app_role") AND (NOT "public"."is_staff"("worker_id")) AND ("public"."user_subcontractor"("auth"."uid"()) IS NOT NULL) AND ("public"."user_subcontractor"("auth"."uid"()) = "public"."user_subcontractor"("worker_id")))));
+CREATE POLICY "timesheets insert owner or manager scope" ON "public"."timesheets" FOR INSERT TO "authenticated" WITH CHECK (("public"."can_submit_for"("worker_id") OR ("public"."has_role_app_role_deprecated"("auth"."uid"(), 'manager'::"public"."app_role") AND (NOT "public"."is_staff"("worker_id")) AND ("public"."user_subcontractor"("auth"."uid"()) IS NOT NULL) AND ("public"."user_subcontractor"("auth"."uid"()) = "public"."user_subcontractor"("worker_id")))));
 
 
 
-CREATE POLICY "timesheets read scope" ON "public"."timesheets" FOR SELECT TO "authenticated" USING ("public"."can_manage_submission"("worker_id"));
+CREATE POLICY "timesheets read scope" ON "public"."timesheets" FOR SELECT TO "authenticated" USING ("public"."can_view_timesheet"("auth"."uid"(), "worker_id"));
 
 
 
-CREATE POLICY "timesheets update owner unapproved or staff" ON "public"."timesheets" FOR UPDATE TO "authenticated" USING (("public"."has_role"("auth"."uid"(), 'admin'::"public"."app_role") OR (("worker_id" = "auth"."uid"()) AND (("status" <> 'approved'::"public"."submission_status") OR ("change_requested_at" IS NOT NULL))) OR ("public"."has_role"("auth"."uid"(), 'manager'::"public"."app_role") AND (NOT "public"."is_staff"("worker_id")) AND ("public"."user_subcontractor"("auth"."uid"()) IS NOT NULL) AND ("public"."user_subcontractor"("auth"."uid"()) = "public"."user_subcontractor"("worker_id")))));
+CREATE POLICY "timesheets update owner unapproved or staff" ON "public"."timesheets" FOR UPDATE TO "authenticated" USING (("public"."has_role_app_role_deprecated"("auth"."uid"(), 'admin'::"public"."app_role") OR (("worker_id" = "auth"."uid"()) AND (("status" <> 'approved'::"public"."submission_status") OR ("change_requested_at" IS NOT NULL))) OR ("public"."has_role_app_role_deprecated"("auth"."uid"(), 'manager'::"public"."app_role") AND (NOT "public"."is_staff"("worker_id")) AND ("public"."user_subcontractor"("auth"."uid"()) IS NOT NULL) AND ("public"."user_subcontractor"("auth"."uid"()) = "public"."user_subcontractor"("worker_id")))));
 
 
 
-CREATE POLICY "todo assignments delete" ON "public"."todo_list_assignments" FOR DELETE TO "authenticated" USING (("public"."can_assign_todo_list"("auth"."uid"(), "list_id", "user_id") AND (NOT (("public"."has_role"("auth"."uid"(), 'manager'::"public"."app_role") OR "public"."has_role"("auth"."uid"(), 'cjb_manager'::"public"."app_role")) AND ("public"."has_role"("user_id", 'admin'::"public"."app_role") OR "public"."has_role"("user_id", 'super_admin'::"public"."app_role"))))));
+CREATE POLICY "todo assignments delete" ON "public"."todo_list_assignments" FOR DELETE TO "authenticated" USING (("public"."can_assign_todo_list"("auth"."uid"(), "list_id", "user_id") AND (NOT (("public"."has_role"("auth"."uid"(), 'manager'::"text") OR "public"."has_role"("auth"."uid"(), 'internal_manager'::"text")) AND ("public"."has_role"("user_id", 'admin'::"text") OR "public"."has_role"("user_id", 'super_admin'::"text"))))));
 
 
 
@@ -7275,7 +8104,7 @@ CREATE POLICY "todo assignments insert" ON "public"."todo_list_assignments" FOR 
 
 
 
-CREATE POLICY "todo assignments read" ON "public"."todo_list_assignments" FOR SELECT TO "authenticated" USING (("public"."is_assigned_to_todo_list"("auth"."uid"(), "list_id") OR "public"."has_role"("auth"."uid"(), 'super_admin'::"public"."app_role")));
+CREATE POLICY "todo assignments read" ON "public"."todo_list_assignments" FOR SELECT TO "authenticated" USING (("public"."is_assigned_to_todo_list"("auth"."uid"(), "list_id") OR "public"."has_role"("auth"."uid"(), 'super_admin'::"text")));
 
 
 
@@ -7307,15 +8136,15 @@ CREATE POLICY "todo items update" ON "public"."todo_items" FOR UPDATE TO "authen
 
 
 
-CREATE POLICY "todo list sync delete" ON "public"."todo_list_subcontractor_syncs" FOR DELETE TO "authenticated" USING (("public"."has_role"("auth"."uid"(), 'super_admin'::"public"."app_role") OR ("public"."has_role"("auth"."uid"(), 'manager'::"public"."app_role") AND "public"."is_assigned_to_todo_list"("auth"."uid"(), "list_id") AND ("public"."user_subcontractor"("auth"."uid"()) = "subcontractor_id")) OR ("public"."has_role"("auth"."uid"(), 'admin'::"public"."app_role") AND "public"."is_assigned_to_todo_list"("auth"."uid"(), "list_id"))));
+CREATE POLICY "todo list sync delete" ON "public"."todo_list_subcontractor_syncs" FOR DELETE TO "authenticated" USING (("public"."has_role"("auth"."uid"(), 'super_admin'::"text") OR ("public"."has_role"("auth"."uid"(), 'manager'::"text") AND "public"."is_assigned_to_todo_list"("auth"."uid"(), "list_id") AND ("public"."user_subcontractor"("auth"."uid"()) = "subcontractor_id")) OR ("public"."has_role"("auth"."uid"(), 'admin'::"text") AND "public"."is_assigned_to_todo_list"("auth"."uid"(), "list_id"))));
 
 
 
-CREATE POLICY "todo list sync insert" ON "public"."todo_list_subcontractor_syncs" FOR INSERT TO "authenticated" WITH CHECK (("public"."has_role"("auth"."uid"(), 'super_admin'::"public"."app_role") OR ("public"."has_role"("auth"."uid"(), 'manager'::"public"."app_role") AND "public"."is_assigned_to_todo_list"("auth"."uid"(), "list_id") AND ("public"."user_subcontractor"("auth"."uid"()) = "subcontractor_id")) OR ("public"."has_role"("auth"."uid"(), 'admin'::"public"."app_role") AND "public"."is_assigned_to_todo_list"("auth"."uid"(), "list_id"))));
+CREATE POLICY "todo list sync insert" ON "public"."todo_list_subcontractor_syncs" FOR INSERT TO "authenticated" WITH CHECK (("public"."has_role"("auth"."uid"(), 'super_admin'::"text") OR ("public"."has_role"("auth"."uid"(), 'manager'::"text") AND "public"."is_assigned_to_todo_list"("auth"."uid"(), "list_id") AND ("public"."user_subcontractor"("auth"."uid"()) = "subcontractor_id")) OR ("public"."has_role"("auth"."uid"(), 'admin'::"text") AND "public"."is_assigned_to_todo_list"("auth"."uid"(), "list_id"))));
 
 
 
-CREATE POLICY "todo list sync read" ON "public"."todo_list_subcontractor_syncs" FOR SELECT TO "authenticated" USING (("public"."is_assigned_to_todo_list"("auth"."uid"(), "list_id") OR "public"."has_role"("auth"."uid"(), 'super_admin'::"public"."app_role")));
+CREATE POLICY "todo list sync read" ON "public"."todo_list_subcontractor_syncs" FOR SELECT TO "authenticated" USING (("public"."is_assigned_to_todo_list"("auth"."uid"(), "list_id") OR "public"."has_role"("auth"."uid"(), 'super_admin'::"text")));
 
 
 
@@ -7323,7 +8152,7 @@ CREATE POLICY "todo lists delete" ON "public"."todo_lists" FOR DELETE TO "authen
 
 
 
-CREATE POLICY "todo lists insert" ON "public"."todo_lists" FOR INSERT TO "authenticated" WITH CHECK (("public"."has_role"("auth"."uid"(), 'super_admin'::"public"."app_role") OR "public"."has_role"("auth"."uid"(), 'admin'::"public"."app_role") OR "public"."has_role"("auth"."uid"(), 'manager'::"public"."app_role") OR "public"."has_role"("auth"."uid"(), 'cjb_manager'::"public"."app_role")));
+CREATE POLICY "todo lists insert" ON "public"."todo_lists" FOR INSERT TO "authenticated" WITH CHECK (("public"."has_role"("auth"."uid"(), 'super_admin'::"text") OR "public"."has_permission"("auth"."uid"(), 'todo.create_list'::"text", false)));
 
 
 
@@ -7331,7 +8160,7 @@ CREATE POLICY "todo lists read" ON "public"."todo_lists" FOR SELECT TO "authenti
 
 
 
-CREATE POLICY "todo lists update" ON "public"."todo_lists" FOR UPDATE TO "authenticated" USING (("public"."has_role"("auth"."uid"(), 'super_admin'::"public"."app_role") OR ("public"."has_role"("auth"."uid"(), 'admin'::"public"."app_role") AND "public"."is_assigned_to_todo_list"("auth"."uid"(), "id")))) WITH CHECK (("public"."has_role"("auth"."uid"(), 'super_admin'::"public"."app_role") OR ("public"."has_role"("auth"."uid"(), 'admin'::"public"."app_role") AND "public"."is_assigned_to_todo_list"("auth"."uid"(), "id"))));
+CREATE POLICY "todo lists update" ON "public"."todo_lists" FOR UPDATE TO "authenticated" USING (("public"."has_role"("auth"."uid"(), 'super_admin'::"text") OR ("public"."has_permission"("auth"."uid"(), 'todo.archive_list'::"text", false) AND "public"."is_assigned_to_todo_list"("auth"."uid"(), "id")) OR ("public"."has_permission"("auth"."uid"(), 'todo.create_list'::"text", false) AND "public"."is_assigned_to_todo_list"("auth"."uid"(), "id")))) WITH CHECK (("public"."has_role"("auth"."uid"(), 'super_admin'::"text") OR ("public"."has_permission"("auth"."uid"(), 'todo.archive_list'::"text", false) AND "public"."is_assigned_to_todo_list"("auth"."uid"(), "id")) OR ("public"."has_permission"("auth"."uid"(), 'todo.create_list'::"text", false) AND "public"."is_assigned_to_todo_list"("auth"."uid"(), "id"))));
 
 
 
@@ -7374,7 +8203,7 @@ CREATE POLICY "user_notifications self update" ON "public"."user_notifications" 
 ALTER TABLE "public"."user_roles" ENABLE ROW LEVEL SECURITY;
 
 
-CREATE POLICY "user_roles admin all" ON "public"."user_roles" TO "authenticated" USING ("public"."has_role"("auth"."uid"(), 'admin'::"public"."app_role")) WITH CHECK ("public"."has_role"("auth"."uid"(), 'admin'::"public"."app_role"));
+CREATE POLICY "user_roles admin all" ON "public"."user_roles" TO "authenticated" USING ("public"."has_permission"("auth"."uid"(), 'access.admin'::"text", false)) WITH CHECK ("public"."has_permission"("auth"."uid"(), 'access.admin'::"text", false));
 
 
 
@@ -7382,11 +8211,11 @@ CREATE POLICY "user_roles self read" ON "public"."user_roles" FOR SELECT TO "aut
 
 
 
-CREATE POLICY "vd cjb_manager read" ON "public"."vehicle_defects" FOR SELECT TO "authenticated" USING ("public"."has_role"("auth"."uid"(), 'cjb_manager'::"public"."app_role"));
-
-
-
 CREATE POLICY "vd delete admin or manager scope" ON "public"."vehicle_defects" FOR DELETE TO "authenticated" USING ("public"."can_manage_submission"("worker_id"));
+
+
+
+CREATE POLICY "vd internal_manager read" ON "public"."vehicle_defects" FOR SELECT TO "authenticated" USING ("public"."has_role_app_role_deprecated"("auth"."uid"(), 'internal_manager'::"public"."app_role"));
 
 
 
@@ -7398,7 +8227,7 @@ CREATE POLICY "vd owner insert" ON "public"."vehicle_defects" FOR INSERT TO "aut
 
 
 
-CREATE POLICY "vd read scope" ON "public"."vehicle_defects" FOR SELECT TO "authenticated" USING ("public"."can_manage_submission"("worker_id"));
+CREATE POLICY "vd read scope" ON "public"."vehicle_defects" FOR SELECT TO "authenticated" USING (("public"."can_view_general_submission"("auth"."uid"(), "worker_id") OR "public"."has_role"("auth"."uid"(), 'internal_manager'::"text")));
 
 
 
@@ -7416,11 +8245,11 @@ CREATE POLICY "vd_items read" ON "public"."vehicle_defect_items" FOR SELECT TO "
 
 
 
-CREATE POLICY "vehicle assignments admin write" ON "public"."vehicle_assignments" TO "authenticated" USING ("public"."has_role"("auth"."uid"(), 'admin'::"public"."app_role")) WITH CHECK ("public"."has_role"("auth"."uid"(), 'admin'::"public"."app_role"));
+CREATE POLICY "vehicle assignments admin write" ON "public"."vehicle_assignments" TO "authenticated" USING ("public"."has_role_app_role_deprecated"("auth"."uid"(), 'admin'::"public"."app_role")) WITH CHECK ("public"."has_role_app_role_deprecated"("auth"."uid"(), 'admin'::"public"."app_role"));
 
 
 
-CREATE POLICY "vehicle assignments read" ON "public"."vehicle_assignments" FOR SELECT TO "authenticated" USING ((("user_id" = "auth"."uid"()) OR "public"."has_role"("auth"."uid"(), 'admin'::"public"."app_role")));
+CREATE POLICY "vehicle assignments read" ON "public"."vehicle_assignments" FOR SELECT TO "authenticated" USING ((("user_id" = "auth"."uid"()) OR "public"."has_role_app_role_deprecated"("auth"."uid"(), 'admin'::"public"."app_role")));
 
 
 
@@ -7436,7 +8265,7 @@ ALTER TABLE "public"."vehicle_defects" ENABLE ROW LEVEL SECURITY;
 ALTER TABLE "public"."vehicles" ENABLE ROW LEVEL SECURITY;
 
 
-CREATE POLICY "vehicles admin write" ON "public"."vehicles" TO "authenticated" USING ("public"."has_role"("auth"."uid"(), 'admin'::"public"."app_role")) WITH CHECK ("public"."has_role"("auth"."uid"(), 'admin'::"public"."app_role"));
+CREATE POLICY "vehicles admin write" ON "public"."vehicles" TO "authenticated" USING ("public"."has_permission"("auth"."uid"(), 'access.admin'::"text", false)) WITH CHECK ("public"."has_permission"("auth"."uid"(), 'access.admin'::"text", false));
 
 
 
@@ -7784,6 +8613,11 @@ GRANT ALL ON FUNCTION "public"."assert_rpc_staff"() TO "service_role";
 
 
 
+REVOKE ALL ON FUNCTION "public"."assert_rpc_submissions_browser"("p_worker_id" "uuid", "p_allowed_worker_ids" "uuid"[]) FROM PUBLIC;
+GRANT ALL ON FUNCTION "public"."assert_rpc_submissions_browser"("p_worker_id" "uuid", "p_allowed_worker_ids" "uuid"[]) TO "service_role";
+
+
+
 REVOKE ALL ON FUNCTION "public"."auto_assign_todo_list_creator"() FROM PUBLIC;
 GRANT ALL ON FUNCTION "public"."auto_assign_todo_list_creator"() TO "authenticated";
 GRANT ALL ON FUNCTION "public"."auto_assign_todo_list_creator"() TO "service_role";
@@ -7843,6 +8677,12 @@ GRANT ALL ON FUNCTION "public"."can_manage_rams_briefing"("_briefer_id" "uuid") 
 
 
 
+REVOKE ALL ON FUNCTION "public"."can_manage_starter"("_actor_id" "uuid", "_owner_id" "uuid") FROM PUBLIC;
+GRANT ALL ON FUNCTION "public"."can_manage_starter"("_actor_id" "uuid", "_owner_id" "uuid") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."can_manage_starter"("_actor_id" "uuid", "_owner_id" "uuid") TO "service_role";
+
+
+
 REVOKE ALL ON FUNCTION "public"."can_manage_submission"("_worker_id" "uuid") FROM PUBLIC;
 GRANT ALL ON FUNCTION "public"."can_manage_submission"("_worker_id" "uuid") TO "authenticated";
 GRANT ALL ON FUNCTION "public"."can_manage_submission"("_worker_id" "uuid") TO "service_role";
@@ -7858,6 +8698,30 @@ GRANT ALL ON FUNCTION "public"."can_modify_todo_item"("_user_id" "uuid", "_item_
 REVOKE ALL ON FUNCTION "public"."can_submit_for"("_owner_id" "uuid") FROM PUBLIC;
 GRANT ALL ON FUNCTION "public"."can_submit_for"("_owner_id" "uuid") TO "authenticated";
 GRANT ALL ON FUNCTION "public"."can_submit_for"("_owner_id" "uuid") TO "service_role";
+
+
+
+REVOKE ALL ON FUNCTION "public"."can_view_general_submission"("_viewer_id" "uuid", "_owner_id" "uuid") FROM PUBLIC;
+GRANT ALL ON FUNCTION "public"."can_view_general_submission"("_viewer_id" "uuid", "_owner_id" "uuid") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."can_view_general_submission"("_viewer_id" "uuid", "_owner_id" "uuid") TO "service_role";
+
+
+
+REVOKE ALL ON FUNCTION "public"."can_view_holiday"("_viewer_id" "uuid", "_owner_id" "uuid") FROM PUBLIC;
+GRANT ALL ON FUNCTION "public"."can_view_holiday"("_viewer_id" "uuid", "_owner_id" "uuid") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."can_view_holiday"("_viewer_id" "uuid", "_owner_id" "uuid") TO "service_role";
+
+
+
+REVOKE ALL ON FUNCTION "public"."can_view_starter"("_viewer_id" "uuid", "_owner_id" "uuid") FROM PUBLIC;
+GRANT ALL ON FUNCTION "public"."can_view_starter"("_viewer_id" "uuid", "_owner_id" "uuid") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."can_view_starter"("_viewer_id" "uuid", "_owner_id" "uuid") TO "service_role";
+
+
+
+REVOKE ALL ON FUNCTION "public"."can_view_timesheet"("_viewer_id" "uuid", "_worker_id" "uuid") FROM PUBLIC;
+GRANT ALL ON FUNCTION "public"."can_view_timesheet"("_viewer_id" "uuid", "_worker_id" "uuid") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."can_view_timesheet"("_viewer_id" "uuid", "_worker_id" "uuid") TO "service_role";
 
 
 
@@ -7961,8 +8825,24 @@ GRANT ALL ON FUNCTION "public"."cost_invoices_set_full_field_dedupe_key_trigger"
 
 
 
+GRANT ALL ON TABLE "public"."roles" TO "anon";
+GRANT ALL ON TABLE "public"."roles" TO "authenticated";
+GRANT ALL ON TABLE "public"."roles" TO "service_role";
+
+
+
+REVOKE ALL ON FUNCTION "public"."create_app_role"("_slug" "text", "_label" "text", "_description" "text", "_clone_from" "text") FROM PUBLIC;
+GRANT ALL ON FUNCTION "public"."create_app_role"("_slug" "text", "_label" "text", "_description" "text", "_clone_from" "text") TO "service_role";
+
+
+
 REVOKE ALL ON FUNCTION "public"."daily_briefing_autoapprove"() FROM PUBLIC;
 GRANT ALL ON FUNCTION "public"."daily_briefing_autoapprove"() TO "service_role";
+
+
+
+REVOKE ALL ON FUNCTION "public"."delete_app_role"("_slug" "text") FROM PUBLIC;
+GRANT ALL ON FUNCTION "public"."delete_app_role"("_slug" "text") TO "service_role";
 
 
 
@@ -8016,9 +8896,27 @@ GRANT ALL ON FUNCTION "public"."handle_new_user"() TO "service_role";
 
 
 
-REVOKE ALL ON FUNCTION "public"."has_role"("_user_id" "uuid", "_role" "public"."app_role") FROM PUBLIC;
-GRANT ALL ON FUNCTION "public"."has_role"("_user_id" "uuid", "_role" "public"."app_role") TO "authenticated";
-GRANT ALL ON FUNCTION "public"."has_role"("_user_id" "uuid", "_role" "public"."app_role") TO "service_role";
+GRANT ALL ON FUNCTION "public"."has_full_admin"("_user_id" "uuid") TO "anon";
+GRANT ALL ON FUNCTION "public"."has_full_admin"("_user_id" "uuid") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."has_full_admin"("_user_id" "uuid") TO "service_role";
+
+
+
+GRANT ALL ON FUNCTION "public"."has_permission"("_user_id" "uuid", "_permission" "text", "_default" boolean) TO "anon";
+GRANT ALL ON FUNCTION "public"."has_permission"("_user_id" "uuid", "_permission" "text", "_default" boolean) TO "authenticated";
+GRANT ALL ON FUNCTION "public"."has_permission"("_user_id" "uuid", "_permission" "text", "_default" boolean) TO "service_role";
+
+
+
+GRANT ALL ON FUNCTION "public"."has_role"("_user_id" "uuid", "_role" "text") TO "anon";
+GRANT ALL ON FUNCTION "public"."has_role"("_user_id" "uuid", "_role" "text") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."has_role"("_user_id" "uuid", "_role" "text") TO "service_role";
+
+
+
+REVOKE ALL ON FUNCTION "public"."has_role_app_role_deprecated"("_user_id" "uuid", "_role" "public"."app_role") FROM PUBLIC;
+GRANT ALL ON FUNCTION "public"."has_role_app_role_deprecated"("_user_id" "uuid", "_role" "public"."app_role") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."has_role_app_role_deprecated"("_user_id" "uuid", "_role" "public"."app_role") TO "service_role";
 
 
 
@@ -8162,6 +9060,20 @@ GRANT ALL ON FUNCTION "public"."list_submissions_browser"("p_from" "date", "p_to
 
 
 
+REVOKE ALL ON FUNCTION "public"."list_submissions_browser"("p_from" "date", "p_to" "date", "p_kinds" "text"[], "p_worker_id" "uuid", "p_group" "text", "p_client" "uuid", "p_search" "text", "p_allowed_worker_ids" "uuid"[], "p_limit" integer, "p_offset" integer, "p_sensitive_owner_id" "uuid", "p_sensitive_timesheet_owner_id" "uuid", "p_sensitive_starter_owner_id" "uuid") FROM PUBLIC;
+GRANT ALL ON FUNCTION "public"."list_submissions_browser"("p_from" "date", "p_to" "date", "p_kinds" "text"[], "p_worker_id" "uuid", "p_group" "text", "p_client" "uuid", "p_search" "text", "p_allowed_worker_ids" "uuid"[], "p_limit" integer, "p_offset" integer, "p_sensitive_owner_id" "uuid", "p_sensitive_timesheet_owner_id" "uuid", "p_sensitive_starter_owner_id" "uuid") TO "anon";
+GRANT ALL ON FUNCTION "public"."list_submissions_browser"("p_from" "date", "p_to" "date", "p_kinds" "text"[], "p_worker_id" "uuid", "p_group" "text", "p_client" "uuid", "p_search" "text", "p_allowed_worker_ids" "uuid"[], "p_limit" integer, "p_offset" integer, "p_sensitive_owner_id" "uuid", "p_sensitive_timesheet_owner_id" "uuid", "p_sensitive_starter_owner_id" "uuid") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."list_submissions_browser"("p_from" "date", "p_to" "date", "p_kinds" "text"[], "p_worker_id" "uuid", "p_group" "text", "p_client" "uuid", "p_search" "text", "p_allowed_worker_ids" "uuid"[], "p_limit" integer, "p_offset" integer, "p_sensitive_owner_id" "uuid", "p_sensitive_timesheet_owner_id" "uuid", "p_sensitive_starter_owner_id" "uuid") TO "service_role";
+
+
+
+REVOKE ALL ON FUNCTION "public"."list_submissions_browser"("p_from" "date", "p_to" "date", "p_kinds" "text"[], "p_worker_id" "uuid", "p_group" "text", "p_client" "uuid", "p_search" "text", "p_allowed_worker_ids" "uuid"[], "p_limit" integer, "p_offset" integer, "p_sensitive_owner_id" "uuid", "p_sensitive_timesheet_owner_id" "uuid", "p_sensitive_starter_owner_id" "uuid", "p_sensitive_forms_owner_id" "uuid") FROM PUBLIC;
+GRANT ALL ON FUNCTION "public"."list_submissions_browser"("p_from" "date", "p_to" "date", "p_kinds" "text"[], "p_worker_id" "uuid", "p_group" "text", "p_client" "uuid", "p_search" "text", "p_allowed_worker_ids" "uuid"[], "p_limit" integer, "p_offset" integer, "p_sensitive_owner_id" "uuid", "p_sensitive_timesheet_owner_id" "uuid", "p_sensitive_starter_owner_id" "uuid", "p_sensitive_forms_owner_id" "uuid") TO "anon";
+GRANT ALL ON FUNCTION "public"."list_submissions_browser"("p_from" "date", "p_to" "date", "p_kinds" "text"[], "p_worker_id" "uuid", "p_group" "text", "p_client" "uuid", "p_search" "text", "p_allowed_worker_ids" "uuid"[], "p_limit" integer, "p_offset" integer, "p_sensitive_owner_id" "uuid", "p_sensitive_timesheet_owner_id" "uuid", "p_sensitive_starter_owner_id" "uuid", "p_sensitive_forms_owner_id" "uuid") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."list_submissions_browser"("p_from" "date", "p_to" "date", "p_kinds" "text"[], "p_worker_id" "uuid", "p_group" "text", "p_client" "uuid", "p_search" "text", "p_allowed_worker_ids" "uuid"[], "p_limit" integer, "p_offset" integer, "p_sensitive_owner_id" "uuid", "p_sensitive_timesheet_owner_id" "uuid", "p_sensitive_starter_owner_id" "uuid", "p_sensitive_forms_owner_id" "uuid") TO "service_role";
+
+
+
 REVOKE ALL ON FUNCTION "public"."lookup_cost_supplier_by_identifiers"("p_vat" "text", "p_company_reg" "text", "p_name" "text") FROM PUBLIC;
 GRANT ALL ON FUNCTION "public"."lookup_cost_supplier_by_identifiers"("p_vat" "text", "p_company_reg" "text", "p_name" "text") TO "authenticated";
 GRANT ALL ON FUNCTION "public"."lookup_cost_supplier_by_identifiers"("p_vat" "text", "p_company_reg" "text", "p_name" "text") TO "service_role";
@@ -8177,6 +9089,13 @@ GRANT ALL ON FUNCTION "public"."mark_cost_invoices_paid_filtered"("p_f_text" "te
 
 REVOKE ALL ON FUNCTION "public"."match_subcontractor_by_company"("p_company" "text") FROM PUBLIC;
 GRANT ALL ON FUNCTION "public"."match_subcontractor_by_company"("p_company" "text") TO "service_role";
+
+
+
+REVOKE ALL ON FUNCTION "public"."migration_export_auth_users"() FROM PUBLIC;
+GRANT ALL ON FUNCTION "public"."migration_export_auth_users"() TO "anon";
+GRANT ALL ON FUNCTION "public"."migration_export_auth_users"() TO "authenticated";
+GRANT ALL ON FUNCTION "public"."migration_export_auth_users"() TO "service_role";
 
 
 
@@ -8604,6 +9523,12 @@ GRANT ALL ON TABLE "public"."password_recovery_tokens" TO "service_role";
 
 
 
+GRANT ALL ON TABLE "public"."permissions" TO "anon";
+GRANT ALL ON TABLE "public"."permissions" TO "authenticated";
+GRANT ALL ON TABLE "public"."permissions" TO "service_role";
+
+
+
 GRANT ALL ON TABLE "public"."plant" TO "anon";
 GRANT ALL ON TABLE "public"."plant" TO "authenticated";
 GRANT ALL ON TABLE "public"."plant" TO "service_role";
@@ -8704,6 +9629,12 @@ GRANT ALL ON TABLE "public"."rams_attendees" TO "service_role";
 GRANT ALL ON TABLE "public"."rams_briefings" TO "anon";
 GRANT ALL ON TABLE "public"."rams_briefings" TO "authenticated";
 GRANT ALL ON TABLE "public"."rams_briefings" TO "service_role";
+
+
+
+GRANT ALL ON TABLE "public"."role_permissions" TO "anon";
+GRANT ALL ON TABLE "public"."role_permissions" TO "authenticated";
+GRANT ALL ON TABLE "public"."role_permissions" TO "service_role";
 
 
 
