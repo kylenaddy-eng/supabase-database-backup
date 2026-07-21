@@ -726,13 +726,27 @@ $$;
 ALTER FUNCTION "public"."can_delete_todo_list"("_user_id" "uuid", "_list_id" "uuid") OWNER TO "postgres";
 
 
+CREATE OR REPLACE FUNCTION "public"."can_manage_or_submit_form_for"("_owner_id" "uuid") RETURNS boolean
+    LANGUAGE "sql" STABLE SECURITY DEFINER
+    SET "search_path" TO 'public'
+    AS $$
+  SELECT
+    public.can_manage_submission(_owner_id)
+    OR public.can_submit_form_for(_owner_id);
+$$;
+
+
+ALTER FUNCTION "public"."can_manage_or_submit_form_for"("_owner_id" "uuid") OWNER TO "postgres";
+
+
 CREATE OR REPLACE FUNCTION "public"."can_manage_rams_briefing"("_briefer_id" "uuid") RETURNS boolean
     LANGUAGE "sql" STABLE SECURITY DEFINER
     SET "search_path" TO 'public'
     AS $$
   SELECT
     public.can_manage_submission(_briefer_id)
-    OR public.has_role(auth.uid(), 'cjb_manager')
+    OR public.has_role(auth.uid(), 'internal_manager')
+    OR public.can_submit_form_for(_briefer_id);
 $$;
 
 
@@ -745,7 +759,16 @@ CREATE OR REPLACE FUNCTION "public"."can_manage_starter"("_actor_id" "uuid", "_o
     AS $$
   SELECT
     public.can_manage_submission(_owner_id)
-    OR public.has_permission(_actor_id, 'submissions.submit_starters_on_behalf', false);
+    OR (
+      public.has_permission(_actor_id, 'submissions.submit_starters_on_behalf', false)
+      AND (
+        public.has_permission(_actor_id, 'data.scope_org_wide', false)
+        OR (
+          public.user_subcontractor(_actor_id) IS NOT NULL
+          AND public.user_subcontractor(_actor_id) = public.user_subcontractor(_owner_id)
+        )
+      )
+    );
 $$;
 
 
@@ -823,6 +846,28 @@ $$;
 
 
 ALTER FUNCTION "public"."can_submit_for"("_owner_id" "uuid") OWNER TO "postgres";
+
+
+CREATE OR REPLACE FUNCTION "public"."can_submit_form_for"("_owner_id" "uuid") RETURNS boolean
+    LANGUAGE "sql" STABLE SECURITY DEFINER
+    SET "search_path" TO 'public'
+    AS $$
+  SELECT
+    _owner_id = auth.uid()
+    OR (
+      public.has_permission(auth.uid(), 'submissions.submit_forms_on_behalf', false)
+      AND (
+        public.has_permission(auth.uid(), 'data.scope_org_wide', false)
+        OR (
+          public.user_subcontractor(auth.uid()) IS NOT NULL
+          AND public.user_subcontractor(auth.uid()) = public.user_subcontractor(_owner_id)
+        )
+      )
+    );
+$$;
+
+
+ALTER FUNCTION "public"."can_submit_form_for"("_owner_id" "uuid") OWNER TO "postgres";
 
 
 CREATE OR REPLACE FUNCTION "public"."can_view_general_submission"("_viewer_id" "uuid", "_owner_id" "uuid") RETURNS boolean
@@ -2172,7 +2217,8 @@ CREATE TABLE IF NOT EXISTS "public"."invoices" (
     "created_by" "uuid",
     "created_at" timestamp with time zone DEFAULT "now"() NOT NULL,
     "updated_at" timestamp with time zone DEFAULT "now"() NOT NULL,
-    "search_document" "tsvector"
+    "search_document" "tsvector",
+    "show_qty_unit_rate" boolean DEFAULT false NOT NULL
 );
 
 
@@ -5513,6 +5559,19 @@ CREATE TABLE IF NOT EXISTS "public"."invoice_clients" (
 ALTER TABLE "public"."invoice_clients" OWNER TO "postgres";
 
 
+CREATE TABLE IF NOT EXISTS "public"."invoice_description_titles" (
+    "id" "uuid" DEFAULT "gen_random_uuid"() NOT NULL,
+    "title" "text" NOT NULL,
+    "position" integer DEFAULT 0 NOT NULL,
+    "active" boolean DEFAULT true NOT NULL,
+    "created_at" timestamp with time zone DEFAULT "now"() NOT NULL,
+    "updated_at" timestamp with time zone DEFAULT "now"() NOT NULL
+);
+
+
+ALTER TABLE "public"."invoice_description_titles" OWNER TO "postgres";
+
+
 CREATE TABLE IF NOT EXISTS "public"."invoice_lines" (
     "id" "uuid" DEFAULT "gen_random_uuid"() NOT NULL,
     "invoice_id" "uuid" NOT NULL,
@@ -5523,11 +5582,28 @@ CREATE TABLE IF NOT EXISTS "public"."invoice_lines" (
     "project_id" "uuid",
     "project_other" "text",
     "created_at" timestamp with time zone DEFAULT "now"() NOT NULL,
-    "updated_at" timestamp with time zone DEFAULT "now"() NOT NULL
+    "updated_at" timestamp with time zone DEFAULT "now"() NOT NULL,
+    "quantity" numeric(12,4),
+    "unit" "text",
+    "rate" numeric(12,2),
+    "description_title" "text"
 );
 
 
 ALTER TABLE "public"."invoice_lines" OWNER TO "postgres";
+
+
+CREATE TABLE IF NOT EXISTS "public"."invoice_units" (
+    "id" "uuid" DEFAULT "gen_random_uuid"() NOT NULL,
+    "label" "text" NOT NULL,
+    "position" integer DEFAULT 0 NOT NULL,
+    "active" boolean DEFAULT true NOT NULL,
+    "created_at" timestamp with time zone DEFAULT "now"() NOT NULL,
+    "updated_at" timestamp with time zone DEFAULT "now"() NOT NULL
+);
+
+
+ALTER TABLE "public"."invoice_units" OWNER TO "postgres";
 
 
 CREATE TABLE IF NOT EXISTS "public"."nas_sync_queue" (
@@ -5964,13 +6040,18 @@ CREATE TABLE IF NOT EXISTS "public"."user_notifications" (
     "body" "text" NOT NULL,
     "url" "text" DEFAULT '/'::"text" NOT NULL,
     "read_at" timestamp with time zone,
-    "created_at" timestamp with time zone DEFAULT "now"() NOT NULL
+    "created_at" timestamp with time zone DEFAULT "now"() NOT NULL,
+    "data" "jsonb"
 );
 
 ALTER TABLE ONLY "public"."user_notifications" REPLICA IDENTITY FULL;
 
 
 ALTER TABLE "public"."user_notifications" OWNER TO "postgres";
+
+
+COMMENT ON COLUMN "public"."user_notifications"."data" IS 'Optional structured payload for notification UIs (e.g. cost_payment invoice list).';
+
 
 
 CREATE TABLE IF NOT EXISTS "public"."user_roles" (
@@ -6257,8 +6338,18 @@ ALTER TABLE ONLY "public"."invoice_clients"
 
 
 
+ALTER TABLE ONLY "public"."invoice_description_titles"
+    ADD CONSTRAINT "invoice_description_titles_pkey" PRIMARY KEY ("id");
+
+
+
 ALTER TABLE ONLY "public"."invoice_lines"
     ADD CONSTRAINT "invoice_lines_pkey" PRIMARY KEY ("id");
+
+
+
+ALTER TABLE ONLY "public"."invoice_units"
+    ADD CONSTRAINT "invoice_units_pkey" PRIMARY KEY ("id");
 
 
 
@@ -6609,11 +6700,19 @@ CREATE INDEX "idx_cost_supplier_identifiers_supplier" ON "public"."cost_supplier
 
 
 
+CREATE INDEX "idx_invoice_description_titles_position" ON "public"."invoice_description_titles" USING "btree" ("position");
+
+
+
 CREATE INDEX "idx_invoice_lines_invoice_id" ON "public"."invoice_lines" USING "btree" ("invoice_id");
 
 
 
 CREATE INDEX "idx_invoice_lines_project_id" ON "public"."invoice_lines" USING "btree" ("project_id");
+
+
+
+CREATE INDEX "idx_invoice_units_position" ON "public"."invoice_units" USING "btree" ("position");
 
 
 
@@ -6918,6 +7017,14 @@ CREATE OR REPLACE TRIGGER "trg_integration_storage_backends_updated" BEFORE UPDA
 
 
 CREATE OR REPLACE TRIGGER "trg_invoice_clients_updated" BEFORE UPDATE ON "public"."invoice_clients" FOR EACH ROW EXECUTE FUNCTION "public"."set_updated_at"();
+
+
+
+CREATE OR REPLACE TRIGGER "trg_invoice_description_titles_updated" BEFORE UPDATE ON "public"."invoice_description_titles" FOR EACH ROW EXECUTE FUNCTION "public"."set_updated_at"();
+
+
+
+CREATE OR REPLACE TRIGGER "trg_invoice_units_updated" BEFORE UPDATE ON "public"."invoice_units" FOR EACH ROW EXECUTE FUNCTION "public"."set_updated_at"();
 
 
 
@@ -7624,11 +7731,11 @@ CREATE POLICY "db internal_manager read" ON "public"."daily_briefings" FOR SELEC
 
 
 
-CREATE POLICY "db owner insert" ON "public"."daily_briefings" FOR INSERT TO "authenticated" WITH CHECK ("public"."can_submit_for"("briefer_id"));
+CREATE POLICY "db owner insert" ON "public"."daily_briefings" FOR INSERT TO "authenticated" WITH CHECK ("public"."can_submit_form_for"("briefer_id"));
 
 
 
-CREATE POLICY "db owner update" ON "public"."daily_briefings" FOR UPDATE TO "authenticated" USING ((("briefer_id" = "auth"."uid"()) OR "public"."can_manage_submission"("briefer_id"))) WITH CHECK ((("briefer_id" = "auth"."uid"()) OR "public"."can_manage_submission"("briefer_id")));
+CREATE POLICY "db owner update" ON "public"."daily_briefings" FOR UPDATE TO "authenticated" USING ("public"."can_manage_or_submit_form_for"("briefer_id")) WITH CHECK ("public"."can_manage_or_submit_form_for"("briefer_id"));
 
 
 
@@ -7642,9 +7749,9 @@ CREATE POLICY "db staff update" ON "public"."daily_briefings" FOR UPDATE TO "aut
 
 CREATE POLICY "db_att owner write" ON "public"."daily_briefing_attendees" TO "authenticated" USING ((EXISTS ( SELECT 1
    FROM "public"."daily_briefings" "b"
-  WHERE (("b"."id" = "daily_briefing_attendees"."briefing_id") AND "public"."can_manage_submission"("b"."briefer_id"))))) WITH CHECK ((EXISTS ( SELECT 1
+  WHERE (("b"."id" = "daily_briefing_attendees"."briefing_id") AND "public"."can_manage_or_submit_form_for"("b"."briefer_id"))))) WITH CHECK ((EXISTS ( SELECT 1
    FROM "public"."daily_briefings" "b"
-  WHERE (("b"."id" = "daily_briefing_attendees"."briefing_id") AND "public"."can_manage_submission"("b"."briefer_id")))));
+  WHERE (("b"."id" = "daily_briefing_attendees"."briefing_id") AND "public"."can_manage_or_submit_form_for"("b"."briefer_id")))));
 
 
 
@@ -7656,9 +7763,9 @@ CREATE POLICY "db_att read" ON "public"."daily_briefing_attendees" FOR SELECT TO
 
 CREATE POLICY "db_haz owner write" ON "public"."daily_briefing_hazards" TO "authenticated" USING ((EXISTS ( SELECT 1
    FROM "public"."daily_briefings" "b"
-  WHERE (("b"."id" = "daily_briefing_hazards"."briefing_id") AND "public"."can_manage_submission"("b"."briefer_id"))))) WITH CHECK ((EXISTS ( SELECT 1
+  WHERE (("b"."id" = "daily_briefing_hazards"."briefing_id") AND "public"."can_manage_or_submit_form_for"("b"."briefer_id"))))) WITH CHECK ((EXISTS ( SELECT 1
    FROM "public"."daily_briefings" "b"
-  WHERE (("b"."id" = "daily_briefing_hazards"."briefing_id") AND "public"."can_manage_submission"("b"."briefer_id")))));
+  WHERE (("b"."id" = "daily_briefing_hazards"."briefing_id") AND "public"."can_manage_or_submit_form_for"("b"."briefer_id")))));
 
 
 
@@ -7682,11 +7789,11 @@ CREATE POLICY "havs assigned read" ON "public"."havs_logs" FOR SELECT TO "authen
 
 
 
-CREATE POLICY "havs delete admin or manager scope" ON "public"."havs_logs" FOR DELETE TO "authenticated" USING ("public"."can_manage_submission"("worker_id"));
+CREATE POLICY "havs delete admin or manager scope" ON "public"."havs_logs" FOR DELETE TO "authenticated" USING ("public"."can_manage_or_submit_form_for"("worker_id"));
 
 
 
-CREATE POLICY "havs insert self or admin on behalf" ON "public"."havs_logs" FOR INSERT TO "authenticated" WITH CHECK ("public"."can_submit_for"("worker_id"));
+CREATE POLICY "havs insert self or scoped on behalf" ON "public"."havs_logs" FOR INSERT TO "authenticated" WITH CHECK ("public"."can_submit_form_for"("worker_id"));
 
 
 
@@ -7698,7 +7805,7 @@ CREATE POLICY "havs read scope" ON "public"."havs_logs" FOR SELECT TO "authentic
 
 
 
-CREATE POLICY "havs update self or staff scope" ON "public"."havs_logs" FOR UPDATE TO "authenticated" USING ("public"."can_manage_submission"("worker_id")) WITH CHECK ("public"."can_manage_submission"("worker_id"));
+CREATE POLICY "havs update self or staff scope" ON "public"."havs_logs" FOR UPDATE TO "authenticated" USING ("public"."can_manage_or_submit_form_for"("worker_id")) WITH CHECK ("public"."can_manage_or_submit_form_for"("worker_id"));
 
 
 
@@ -7714,9 +7821,9 @@ CREATE POLICY "havs_items read" ON "public"."havs_log_items" FOR SELECT TO "auth
 
 CREATE POLICY "havs_items write" ON "public"."havs_log_items" TO "authenticated" USING ((EXISTS ( SELECT 1
    FROM "public"."havs_logs" "h"
-  WHERE (("h"."id" = "havs_log_items"."log_id") AND "public"."can_manage_submission"("h"."worker_id") AND (("h"."status" = 'submitted'::"public"."submission_status") OR "public"."has_role_app_role_deprecated"("auth"."uid"(), 'admin'::"public"."app_role")))))) WITH CHECK ((EXISTS ( SELECT 1
+  WHERE (("h"."id" = "havs_log_items"."log_id") AND "public"."can_manage_or_submit_form_for"("h"."worker_id") AND (("h"."status" = 'submitted'::"public"."submission_status") OR "public"."has_role"("auth"."uid"(), 'admin'::"text")))))) WITH CHECK ((EXISTS ( SELECT 1
    FROM "public"."havs_logs" "h"
-  WHERE (("h"."id" = "havs_log_items"."log_id") AND "public"."can_manage_submission"("h"."worker_id") AND (("h"."status" = 'submitted'::"public"."submission_status") OR "public"."has_role_app_role_deprecated"("auth"."uid"(), 'admin'::"public"."app_role"))))));
+  WHERE (("h"."id" = "havs_log_items"."log_id") AND "public"."can_manage_or_submit_form_for"("h"."worker_id") AND (("h"."status" = 'submitted'::"public"."submission_status") OR "public"."has_role"("auth"."uid"(), 'admin'::"text"))))));
 
 
 
@@ -7752,10 +7859,24 @@ CREATE POLICY "invoice_clients admin all" ON "public"."invoice_clients" TO "auth
 
 
 
+ALTER TABLE "public"."invoice_description_titles" ENABLE ROW LEVEL SECURITY;
+
+
+CREATE POLICY "invoice_description_titles admin all" ON "public"."invoice_description_titles" TO "authenticated" USING ("public"."has_permission"("auth"."uid"(), 'access.invoices'::"text", false)) WITH CHECK ("public"."has_permission"("auth"."uid"(), 'access.invoices'::"text", false));
+
+
+
 ALTER TABLE "public"."invoice_lines" ENABLE ROW LEVEL SECURITY;
 
 
 CREATE POLICY "invoice_lines admin all" ON "public"."invoice_lines" TO "authenticated" USING ("public"."has_permission"("auth"."uid"(), 'access.invoices'::"text", false)) WITH CHECK ("public"."has_permission"("auth"."uid"(), 'access.invoices'::"text", false));
+
+
+
+ALTER TABLE "public"."invoice_units" ENABLE ROW LEVEL SECURITY;
+
+
+CREATE POLICY "invoice_units admin all" ON "public"."invoice_units" TO "authenticated" USING ("public"."has_permission"("auth"."uid"(), 'access.invoices'::"text", false)) WITH CHECK ("public"."has_permission"("auth"."uid"(), 'access.invoices'::"text", false));
 
 
 
@@ -7787,7 +7908,7 @@ CREATE POLICY "notification_preferences self update" ON "public"."notification_p
 ALTER TABLE "public"."password_recovery_tokens" ENABLE ROW LEVEL SECURITY;
 
 
-CREATE POLICY "photos manage by parent manager" ON "public"."submission_photos" TO "authenticated" USING ("public"."can_manage_submission"("public"."submission_owner"("kind", "submission_id"))) WITH CHECK ("public"."can_manage_submission"("public"."submission_owner"("kind", "submission_id")));
+CREATE POLICY "photos manage by parent manager" ON "public"."submission_photos" TO "authenticated" USING ("public"."can_manage_or_submit_form_for"("public"."submission_owner"("kind", "submission_id"))) WITH CHECK ("public"."can_manage_or_submit_form_for"("public"."submission_owner"("kind", "submission_id")));
 
 
 
@@ -7807,11 +7928,15 @@ CREATE POLICY "pi internal_manager read" ON "public"."plant_inspections" FOR SEL
 
 
 
-CREATE POLICY "pi manage update" ON "public"."plant_inspections" FOR UPDATE TO "authenticated" USING ("public"."can_manage_submission"("worker_id")) WITH CHECK ("public"."can_manage_submission"("worker_id"));
+CREATE POLICY "pi manage delete" ON "public"."plant_inspections" FOR DELETE TO "authenticated" USING ("public"."can_manage_or_submit_form_for"("worker_id"));
 
 
 
-CREATE POLICY "pi owner insert" ON "public"."plant_inspections" FOR INSERT TO "authenticated" WITH CHECK ("public"."can_submit_for"("worker_id"));
+CREATE POLICY "pi manage update" ON "public"."plant_inspections" FOR UPDATE TO "authenticated" USING ("public"."can_manage_or_submit_form_for"("worker_id")) WITH CHECK ("public"."can_manage_or_submit_form_for"("worker_id"));
+
+
+
+CREATE POLICY "pi owner insert" ON "public"."plant_inspections" FOR INSERT TO "authenticated" WITH CHECK ("public"."can_submit_form_for"("worker_id"));
 
 
 
@@ -7821,9 +7946,9 @@ CREATE POLICY "pi read scope" ON "public"."plant_inspections" FOR SELECT TO "aut
 
 CREATE POLICY "pi_items owner write" ON "public"."plant_inspection_items" TO "authenticated" USING ((EXISTS ( SELECT 1
    FROM "public"."plant_inspections" "p"
-  WHERE (("p"."id" = "plant_inspection_items"."inspection_id") AND "public"."can_manage_submission"("p"."worker_id"))))) WITH CHECK ((EXISTS ( SELECT 1
+  WHERE (("p"."id" = "plant_inspection_items"."inspection_id") AND "public"."can_manage_or_submit_form_for"("p"."worker_id"))))) WITH CHECK ((EXISTS ( SELECT 1
    FROM "public"."plant_inspections" "p"
-  WHERE (("p"."id" = "plant_inspection_items"."inspection_id") AND "public"."can_manage_submission"("p"."worker_id")))));
+  WHERE (("p"."id" = "plant_inspection_items"."inspection_id") AND "public"."can_manage_or_submit_form_for"("p"."worker_id")))));
 
 
 
@@ -7918,7 +8043,7 @@ CREATE POLICY "rams manage update" ON "public"."rams_briefings" FOR UPDATE TO "a
 
 
 
-CREATE POLICY "rams owner insert" ON "public"."rams_briefings" FOR INSERT TO "authenticated" WITH CHECK ("public"."can_submit_for"("briefer_id"));
+CREATE POLICY "rams owner insert" ON "public"."rams_briefings" FOR INSERT TO "authenticated" WITH CHECK ("public"."can_submit_form_for"("briefer_id"));
 
 
 
@@ -8030,11 +8155,11 @@ CREATE POLICY "tbx internal_manager read" ON "public"."toolbox_talks" FOR SELECT
 
 
 
-CREATE POLICY "tbx owner insert" ON "public"."toolbox_talks" FOR INSERT TO "authenticated" WITH CHECK ("public"."can_submit_for"("briefer_id"));
+CREATE POLICY "tbx owner insert" ON "public"."toolbox_talks" FOR INSERT TO "authenticated" WITH CHECK ("public"."can_submit_form_for"("briefer_id"));
 
 
 
-CREATE POLICY "tbx owner update" ON "public"."toolbox_talks" FOR UPDATE TO "authenticated" USING ((("briefer_id" = "auth"."uid"()) OR "public"."can_manage_submission"("briefer_id"))) WITH CHECK ((("briefer_id" = "auth"."uid"()) OR "public"."can_manage_submission"("briefer_id")));
+CREATE POLICY "tbx owner update" ON "public"."toolbox_talks" FOR UPDATE TO "authenticated" USING ("public"."can_manage_or_submit_form_for"("briefer_id")) WITH CHECK ("public"."can_manage_or_submit_form_for"("briefer_id"));
 
 
 
@@ -8048,9 +8173,9 @@ CREATE POLICY "tbx staff update" ON "public"."toolbox_talks" FOR UPDATE TO "auth
 
 CREATE POLICY "tbx_att owner write" ON "public"."toolbox_attendees" TO "authenticated" USING ((EXISTS ( SELECT 1
    FROM "public"."toolbox_talks" "t"
-  WHERE (("t"."id" = "toolbox_attendees"."talk_id") AND "public"."can_manage_submission"("t"."briefer_id"))))) WITH CHECK ((EXISTS ( SELECT 1
+  WHERE (("t"."id" = "toolbox_attendees"."talk_id") AND "public"."can_manage_or_submit_form_for"("t"."briefer_id"))))) WITH CHECK ((EXISTS ( SELECT 1
    FROM "public"."toolbox_talks" "t"
-  WHERE (("t"."id" = "toolbox_attendees"."talk_id") AND "public"."can_manage_submission"("t"."briefer_id")))));
+  WHERE (("t"."id" = "toolbox_attendees"."talk_id") AND "public"."can_manage_or_submit_form_for"("t"."briefer_id")))));
 
 
 
@@ -8219,11 +8344,15 @@ CREATE POLICY "vd internal_manager read" ON "public"."vehicle_defects" FOR SELEC
 
 
 
-CREATE POLICY "vd manage update" ON "public"."vehicle_defects" FOR UPDATE TO "authenticated" USING ("public"."can_manage_submission"("worker_id")) WITH CHECK ("public"."can_manage_submission"("worker_id"));
+CREATE POLICY "vd manage delete" ON "public"."vehicle_defects" FOR DELETE TO "authenticated" USING ("public"."can_manage_or_submit_form_for"("worker_id"));
 
 
 
-CREATE POLICY "vd owner insert" ON "public"."vehicle_defects" FOR INSERT TO "authenticated" WITH CHECK ("public"."can_submit_for"("worker_id"));
+CREATE POLICY "vd manage update" ON "public"."vehicle_defects" FOR UPDATE TO "authenticated" USING ("public"."can_manage_or_submit_form_for"("worker_id")) WITH CHECK ("public"."can_manage_or_submit_form_for"("worker_id"));
+
+
+
+CREATE POLICY "vd owner insert" ON "public"."vehicle_defects" FOR INSERT TO "authenticated" WITH CHECK ("public"."can_submit_form_for"("worker_id"));
 
 
 
@@ -8233,9 +8362,9 @@ CREATE POLICY "vd read scope" ON "public"."vehicle_defects" FOR SELECT TO "authe
 
 CREATE POLICY "vd_items owner write" ON "public"."vehicle_defect_items" TO "authenticated" USING ((EXISTS ( SELECT 1
    FROM "public"."vehicle_defects" "v"
-  WHERE (("v"."id" = "vehicle_defect_items"."defect_id") AND "public"."can_manage_submission"("v"."worker_id"))))) WITH CHECK ((EXISTS ( SELECT 1
+  WHERE (("v"."id" = "vehicle_defect_items"."defect_id") AND "public"."can_manage_or_submit_form_for"("v"."worker_id"))))) WITH CHECK ((EXISTS ( SELECT 1
    FROM "public"."vehicle_defects" "v"
-  WHERE (("v"."id" = "vehicle_defect_items"."defect_id") AND "public"."can_manage_submission"("v"."worker_id")))));
+  WHERE (("v"."id" = "vehicle_defect_items"."defect_id") AND "public"."can_manage_or_submit_form_for"("v"."worker_id")))));
 
 
 
@@ -8671,6 +8800,12 @@ GRANT ALL ON FUNCTION "public"."can_delete_todo_list"("_user_id" "uuid", "_list_
 
 
 
+REVOKE ALL ON FUNCTION "public"."can_manage_or_submit_form_for"("_owner_id" "uuid") FROM PUBLIC;
+GRANT ALL ON FUNCTION "public"."can_manage_or_submit_form_for"("_owner_id" "uuid") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."can_manage_or_submit_form_for"("_owner_id" "uuid") TO "service_role";
+
+
+
 REVOKE ALL ON FUNCTION "public"."can_manage_rams_briefing"("_briefer_id" "uuid") FROM PUBLIC;
 GRANT ALL ON FUNCTION "public"."can_manage_rams_briefing"("_briefer_id" "uuid") TO "authenticated";
 GRANT ALL ON FUNCTION "public"."can_manage_rams_briefing"("_briefer_id" "uuid") TO "service_role";
@@ -8698,6 +8833,12 @@ GRANT ALL ON FUNCTION "public"."can_modify_todo_item"("_user_id" "uuid", "_item_
 REVOKE ALL ON FUNCTION "public"."can_submit_for"("_owner_id" "uuid") FROM PUBLIC;
 GRANT ALL ON FUNCTION "public"."can_submit_for"("_owner_id" "uuid") TO "authenticated";
 GRANT ALL ON FUNCTION "public"."can_submit_for"("_owner_id" "uuid") TO "service_role";
+
+
+
+REVOKE ALL ON FUNCTION "public"."can_submit_form_for"("_owner_id" "uuid") FROM PUBLIC;
+GRANT ALL ON FUNCTION "public"."can_submit_form_for"("_owner_id" "uuid") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."can_submit_form_for"("_owner_id" "uuid") TO "service_role";
 
 
 
@@ -9499,9 +9640,21 @@ GRANT ALL ON TABLE "public"."invoice_clients" TO "service_role";
 
 
 
+GRANT ALL ON TABLE "public"."invoice_description_titles" TO "anon";
+GRANT ALL ON TABLE "public"."invoice_description_titles" TO "authenticated";
+GRANT ALL ON TABLE "public"."invoice_description_titles" TO "service_role";
+
+
+
 GRANT ALL ON TABLE "public"."invoice_lines" TO "anon";
 GRANT ALL ON TABLE "public"."invoice_lines" TO "authenticated";
 GRANT ALL ON TABLE "public"."invoice_lines" TO "service_role";
+
+
+
+GRANT ALL ON TABLE "public"."invoice_units" TO "anon";
+GRANT ALL ON TABLE "public"."invoice_units" TO "authenticated";
+GRANT ALL ON TABLE "public"."invoice_units" TO "service_role";
 
 
 
