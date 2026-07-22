@@ -1524,7 +1524,7 @@ BEGIN
      LIMIT 1;
 
     IF v_canonical IS NOT NULL THEN
-      NEW.company_name := v_canonical;
+      NEW.company_name := public.resolve_cost_company_canonical(v_canonical);
       NEW.supplier_id := v_supplier_id;
     ELSE
       NEW.company_name := public.resolve_cost_company_for_invoice(
@@ -1532,6 +1532,9 @@ BEGIN
         NEW.source_email_from,
         NEW.invoice_number
       );
+      IF NEW.company_name IS NOT NULL THEN
+        NEW.company_name := public.resolve_cost_company_canonical(NEW.company_name);
+      END IF;
     END IF;
   END IF;
 
@@ -1811,11 +1814,14 @@ DECLARE
   v_name text;
   v_key text;
   v_id uuid;
+  v_alias_name text;
 BEGIN
   v_name := btrim(coalesce(p_canonical_name, ''));
   IF v_name = '' OR upper(v_name) = 'NA' THEN
     RETURN NULL;
   END IF;
+
+  v_name := public.resolve_cost_company_canonical(v_name);
 
   SELECT id INTO v_id
     FROM public.cost_suppliers
@@ -1833,6 +1839,18 @@ BEGIN
      ORDER BY cs.created_at ASC
      LIMIT 1;
     IF v_id IS NOT NULL THEN
+      v_alias_name := public.resolve_cost_company_canonical(
+        (SELECT cs2.canonical_name FROM public.cost_suppliers cs2 WHERE cs2.id = v_id)
+      );
+      IF v_alias_name IS NOT NULL
+         AND v_alias_name IS DISTINCT FROM (
+           SELECT cs3.canonical_name FROM public.cost_suppliers cs3 WHERE cs3.id = v_id
+         ) THEN
+        UPDATE public.cost_suppliers cs
+           SET canonical_name = v_alias_name,
+               updated_at = now()
+         WHERE cs.id = v_id;
+      END IF;
       RETURN v_id;
     END IF;
   END IF;
@@ -3697,8 +3715,6 @@ DECLARE
   v_canonical text;
   v_owners int;
 BEGIN
-  -- 1) Legal name: distinguishes group members that share a VAT / reg number.
-  --    Match a supplier by its canonical match-key or a stored legal_name id.
   IF p_name IS NOT NULL
      AND btrim(p_name) <> ''
      AND upper(btrim(p_name)) <> 'NA' THEN
@@ -3712,7 +3728,7 @@ BEGIN
        LIMIT 1;
       IF v_supplier_id IS NOT NULL THEN
         supplier_id := v_supplier_id;
-        canonical_name := v_canonical;
+        canonical_name := public.resolve_cost_company_canonical(v_canonical);
         RETURN NEXT;
         RETURN;
       END IF;
@@ -3730,16 +3746,13 @@ BEGIN
        LIMIT 1;
       IF v_supplier_id IS NOT NULL THEN
         supplier_id := v_supplier_id;
-        canonical_name := v_canonical;
+        canonical_name := public.resolve_cost_company_canonical(v_canonical);
         RETURN NEXT;
         RETURN;
       END IF;
     END IF;
   END IF;
 
-  -- 2) Company registration number: catches name typos, but only when it maps
-  --    to exactly one supplier (a shared/group reg is ambiguous once the legal
-  --    name has failed to match).
   v_reg_key := public.normalize_company_registration(p_company_reg);
   IF v_reg_key IS NOT NULL THEN
     SELECT count(DISTINCT csi.supplier_id)
@@ -3756,15 +3769,12 @@ BEGIN
          AND csi.identifier_key = v_reg_key
        LIMIT 1;
       supplier_id := v_supplier_id;
-      canonical_name := v_canonical;
+      canonical_name := public.resolve_cost_company_canonical(v_canonical);
       RETURN NEXT;
       RETURN;
     END IF;
   END IF;
 
-  -- 3) VAT number: same rule — only trusted when it maps to exactly one
-  --    supplier. Otherwise defer to the name-based fallback (create/find by
-  --    name) rather than guessing the wrong entity.
   v_vat_key := public.normalize_vat_number(p_vat);
   IF v_vat_key IS NOT NULL THEN
     SELECT count(DISTINCT csi.supplier_id)
@@ -3781,7 +3791,7 @@ BEGIN
          AND csi.identifier_key = v_vat_key
        LIMIT 1;
       supplier_id := v_supplier_id;
-      canonical_name := v_canonical;
+      canonical_name := public.resolve_cost_company_canonical(v_canonical);
       RETURN NEXT;
       RETURN;
     END IF;
@@ -4514,14 +4524,13 @@ BEGIN
 
   v_resolved := public.resolve_company_from_costs_table(v_domain, v_format_key, p_name);
   IF v_resolved IS NOT NULL THEN
-    RETURN v_resolved;
+    RETURN public.resolve_cost_company_canonical(v_resolved);
   END IF;
 
   IF v_has_pdf_name THEN
-    RETURN btrim(p_name);
+    RETURN public.resolve_cost_company_canonical(btrim(p_name));
   END IF;
 
-  -- No PDF name: domain-only lookup from existing table rows.
   IF v_domain IS NOT NULL THEN
     SELECT count(DISTINCT ci.company_name)
       INTO v_domain_cnt
@@ -4539,7 +4548,7 @@ BEGIN
          AND ci.company_name IS NOT NULL
          AND btrim(ci.company_name) <> ''
          AND upper(btrim(ci.company_name)) <> 'NA';
-      RETURN v_domain_only;
+      RETURN public.resolve_cost_company_canonical(v_domain_only);
     ELSIF v_domain_cnt > 1 THEN
       SELECT ci.company_name
         INTO v_domain_only
@@ -4552,7 +4561,7 @@ BEGIN
        ORDER BY count(*) DESC, max(ci.created_at) DESC
        LIMIT 1;
       IF v_domain_only IS NOT NULL THEN
-        RETURN v_domain_only;
+        RETURN public.resolve_cost_company_canonical(v_domain_only);
       END IF;
     END IF;
   END IF;
@@ -4580,6 +4589,7 @@ BEGIN
    LIMIT 1;
 
   IF v_supplier_id IS NOT NULL THEN
+    v_canonical := public.resolve_cost_company_canonical(v_canonical);
     PERFORM public.upsert_cost_supplier_identifiers(
       v_supplier_id, p_vat, p_company_reg, p_name, p_source_invoice_id
     );
@@ -4599,7 +4609,8 @@ BEGIN
     RETURN;
   END IF;
 
-  SELECT cs.canonical_name INTO v_canonical
+  SELECT public.resolve_cost_company_canonical(cs.canonical_name)
+    INTO v_canonical
     FROM public.cost_suppliers cs
    WHERE cs.id = v_supplier_id;
 
