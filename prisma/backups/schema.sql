@@ -4933,6 +4933,19 @@ $$;
 ALTER FUNCTION "public"."set_integration_secret"("p_name" "text", "p_value" "text") OWNER TO "postgres";
 
 
+CREATE OR REPLACE FUNCTION "public"."set_rams_documents_updated_at"() RETURNS "trigger"
+    LANGUAGE "plpgsql"
+    AS $$
+BEGIN
+  NEW.updated_at = now();
+  RETURN NEW;
+END;
+$$;
+
+
+ALTER FUNCTION "public"."set_rams_documents_updated_at"() OWNER TO "postgres";
+
+
 CREATE OR REPLACE FUNCTION "public"."set_updated_at"() RETURNS "trigger"
     LANGUAGE "plpgsql"
     SET "search_path" TO 'public'
@@ -6224,6 +6237,48 @@ CREATE TABLE IF NOT EXISTS "public"."rams_briefings" (
 ALTER TABLE "public"."rams_briefings" OWNER TO "postgres";
 
 
+CREATE TABLE IF NOT EXISTS "public"."rams_documents" (
+    "id" "uuid" DEFAULT "gen_random_uuid"() NOT NULL,
+    "created_by" "uuid" NOT NULL,
+    "created_at" timestamp with time zone DEFAULT "now"() NOT NULL,
+    "updated_at" timestamp with time zone DEFAULT "now"() NOT NULL,
+    "status" "text" DEFAULT 'draft'::"text" NOT NULL,
+    "title" "text" DEFAULT ''::"text" NOT NULL,
+    "client_id" "uuid",
+    "project_id" "uuid",
+    "client_other" "text",
+    "project_other" "text",
+    "site_postcode" "text",
+    "site_location_text" "text",
+    "nearest_hospital" "jsonb",
+    "site_contacts" "jsonb",
+    "start_date" "date",
+    "duration_text" "text",
+    "working_hours" "text",
+    "revision" "text",
+    "prepared_by" "text",
+    "approved_by" "text",
+    "revision_date" "date",
+    "selected_equipment" "jsonb" DEFAULT '[]'::"jsonb" NOT NULL,
+    "selected_activity_ids" "text"[] DEFAULT '{}'::"text"[] NOT NULL,
+    "generated_payload" "jsonb",
+    "gemini_notes" "text",
+    "drawings_text" "text",
+    "cover_image_url" "text",
+    "revision_amendment" "text",
+    "figure_images" "jsonb" DEFAULT '[]'::"jsonb" NOT NULL,
+    "work_description" "text",
+    "ai_amendment_instruction" "text",
+    "site_latitude" double precision,
+    "site_longitude" double precision,
+    "ai_reference_images" "jsonb" DEFAULT '[]'::"jsonb" NOT NULL,
+    CONSTRAINT "rams_documents_status_check" CHECK (("status" = ANY (ARRAY['draft'::"text", 'final'::"text"])))
+);
+
+
+ALTER TABLE "public"."rams_documents" OWNER TO "postgres";
+
+
 CREATE TABLE IF NOT EXISTS "public"."role_permissions" (
     "role" "text" NOT NULL,
     "permission" "text" NOT NULL,
@@ -6862,6 +6917,11 @@ ALTER TABLE ONLY "public"."rams_briefings"
 
 
 
+ALTER TABLE ONLY "public"."rams_documents"
+    ADD CONSTRAINT "rams_documents_pkey" PRIMARY KEY ("id");
+
+
+
 ALTER TABLE ONLY "public"."role_permissions"
     ADD CONSTRAINT "role_permissions_pkey" PRIMARY KEY ("role", "permission");
 
@@ -7204,6 +7264,14 @@ CREATE INDEX "rams_briefings_briefer_id_briefing_date_idx" ON "public"."rams_bri
 
 
 
+CREATE INDEX "rams_documents_created_by_idx" ON "public"."rams_documents" USING "btree" ("created_by");
+
+
+
+CREATE INDEX "rams_documents_updated_at_idx" ON "public"."rams_documents" USING "btree" ("updated_at" DESC);
+
+
+
 CREATE INDEX "submission_photos_kind_submission_id_idx" ON "public"."submission_photos" USING "btree" ("kind", "submission_id");
 
 
@@ -7381,6 +7449,10 @@ CREATE OR REPLACE TRIGGER "profiles_guard_sensitive_self_update" BEFORE UPDATE O
 
 
 CREATE OR REPLACE TRIGGER "profiles_sync_todo_list_assignments" AFTER INSERT OR UPDATE OF "subcontractor_id", "active" ON "public"."profiles" FOR EACH ROW EXECUTE FUNCTION "public"."sync_todo_list_assignments_for_profile"();
+
+
+
+CREATE OR REPLACE TRIGGER "rams_documents_updated_at" BEFORE UPDATE ON "public"."rams_documents" FOR EACH ROW EXECUTE FUNCTION "public"."set_rams_documents_updated_at"();
 
 
 
@@ -7768,6 +7840,21 @@ ALTER TABLE ONLY "public"."rams_briefings"
 
 ALTER TABLE ONLY "public"."rams_briefings"
     ADD CONSTRAINT "rams_briefings_project_id_fkey" FOREIGN KEY ("project_id") REFERENCES "public"."projects"("id");
+
+
+
+ALTER TABLE ONLY "public"."rams_documents"
+    ADD CONSTRAINT "rams_documents_client_id_fkey" FOREIGN KEY ("client_id") REFERENCES "public"."clients"("id") ON DELETE SET NULL;
+
+
+
+ALTER TABLE ONLY "public"."rams_documents"
+    ADD CONSTRAINT "rams_documents_created_by_fkey" FOREIGN KEY ("created_by") REFERENCES "auth"."users"("id") ON DELETE CASCADE;
+
+
+
+ALTER TABLE ONLY "public"."rams_documents"
+    ADD CONSTRAINT "rams_documents_project_id_fkey" FOREIGN KEY ("project_id") REFERENCES "public"."projects"("id") ON DELETE SET NULL;
 
 
 
@@ -8546,6 +8633,25 @@ ALTER TABLE "public"."rams_attendees" ENABLE ROW LEVEL SECURITY;
 
 
 ALTER TABLE "public"."rams_briefings" ENABLE ROW LEVEL SECURITY;
+
+
+ALTER TABLE "public"."rams_documents" ENABLE ROW LEVEL SECURITY;
+
+
+CREATE POLICY "rams_documents delete own with permission" ON "public"."rams_documents" FOR DELETE TO "authenticated" USING ((("created_by" = "auth"."uid"()) AND "public"."has_permission"("auth"."uid"(), 'access.rams_builder'::"text", false)));
+
+
+
+CREATE POLICY "rams_documents insert own with permission" ON "public"."rams_documents" FOR INSERT TO "authenticated" WITH CHECK ((("created_by" = "auth"."uid"()) AND "public"."has_permission"("auth"."uid"(), 'access.rams_builder'::"text", false)));
+
+
+
+CREATE POLICY "rams_documents select own with permission" ON "public"."rams_documents" FOR SELECT TO "authenticated" USING ((("created_by" = "auth"."uid"()) AND "public"."has_permission"("auth"."uid"(), 'access.rams_builder'::"text", false)));
+
+
+
+CREATE POLICY "rams_documents update own with permission" ON "public"."rams_documents" FOR UPDATE TO "authenticated" USING ((("created_by" = "auth"."uid"()) AND "public"."has_permission"("auth"."uid"(), 'access.rams_builder'::"text", false))) WITH CHECK ((("created_by" = "auth"."uid"()) AND "public"."has_permission"("auth"."uid"(), 'access.rams_builder'::"text", false)));
+
 
 
 ALTER TABLE "public"."role_permissions" ENABLE ROW LEVEL SECURITY;
@@ -9857,6 +9963,12 @@ GRANT ALL ON FUNCTION "public"."set_integration_secret"("p_name" "text", "p_valu
 
 
 
+GRANT ALL ON FUNCTION "public"."set_rams_documents_updated_at"() TO "anon";
+GRANT ALL ON FUNCTION "public"."set_rams_documents_updated_at"() TO "authenticated";
+GRANT ALL ON FUNCTION "public"."set_rams_documents_updated_at"() TO "service_role";
+
+
+
 REVOKE ALL ON FUNCTION "public"."set_updated_at"() FROM PUBLIC;
 GRANT ALL ON FUNCTION "public"."set_updated_at"() TO "service_role";
 
@@ -10321,6 +10433,12 @@ GRANT ALL ON TABLE "public"."rams_attendees" TO "service_role";
 GRANT ALL ON TABLE "public"."rams_briefings" TO "anon";
 GRANT ALL ON TABLE "public"."rams_briefings" TO "authenticated";
 GRANT ALL ON TABLE "public"."rams_briefings" TO "service_role";
+
+
+
+GRANT ALL ON TABLE "public"."rams_documents" TO "anon";
+GRANT ALL ON TABLE "public"."rams_documents" TO "authenticated";
+GRANT ALL ON TABLE "public"."rams_documents" TO "service_role";
 
 
 
