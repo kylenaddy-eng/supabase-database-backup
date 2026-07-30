@@ -222,15 +222,11 @@ CREATE OR REPLACE FUNCTION "public"."aggregate_cost_invoice_summary"("p_f_text" 
     SELECT
       count(*)::bigint AS invoice_count,
       coalesce(sum(
-        coalesce(
-          f.total_amount,
-          CASE
-            WHEN f.vat_treatment = 'reverse_charge' THEN
-              coalesce(f.net_amount, 0) - coalesce(f.cis_amount, 0)
-            ELSE
-              coalesce(f.net_amount, 0) + coalesce(f.vat_amount, 0)
+        coalesce(f.net_amount, 0)
+        + CASE
+            WHEN f.vat_treatment = 'reverse_charge' THEN 0
+            ELSE coalesce(f.vat_amount, 0)
           END
-        )
       ), 0) AS spend,
       coalesce(sum(CASE WHEN f.vat_treatment = 'standard_20' THEN coalesce(f.vat_amount, 0) ELSE 0 END), 0) AS input_vat,
       coalesce(sum(
@@ -335,15 +331,11 @@ CREATE OR REPLACE FUNCTION "public"."aggregate_cost_invoices"("p_f_text" "text" 
   summary AS (
     SELECT
       coalesce(sum(
-        coalesce(
-          f.total_amount,
-          CASE
-            WHEN f.vat_treatment = 'reverse_charge' THEN
-              coalesce(f.net_amount, 0) - coalesce(f.cis_amount, 0)
-            ELSE
-              coalesce(f.net_amount, 0) + coalesce(f.vat_amount, 0)
+        coalesce(f.net_amount, 0)
+        + CASE
+            WHEN f.vat_treatment = 'reverse_charge' THEN 0
+            ELSE coalesce(f.vat_amount, 0)
           END
-        )
       ), 0) AS spend,
       coalesce(sum(CASE WHEN f.vat_treatment = 'standard_20' THEN coalesce(f.vat_amount, 0) ELSE 0 END), 0) AS input_vat,
       coalesce(sum(
@@ -896,20 +888,64 @@ CREATE OR REPLACE FUNCTION "public"."can_access_submission"("_kind" "public"."su
     LANGUAGE "sql" STABLE SECURITY DEFINER
     SET "search_path" TO 'public'
     AS $$
-  select case _kind
-    when 'plant_inspection' then exists (select 1 from public.plant_inspections p where p.id = _submission_id and (p.worker_id = auth.uid() or public.is_staff(auth.uid())))
-    when 'vehicle_defect' then exists (select 1 from public.vehicle_defects v where v.id = _submission_id and (v.worker_id = auth.uid() or public.is_staff(auth.uid())))
-    when 'timesheet' then exists (select 1 from public.timesheets t where t.id = _submission_id and (t.worker_id = auth.uid() or public.is_staff(auth.uid())))
-    when 'rams_briefing' then exists (select 1 from public.rams_briefings r where r.id = _submission_id and (r.briefer_id = auth.uid() or public.is_staff(auth.uid())))
-    when 'starter' then exists (select 1 from public.employee_starters s where s.id = _submission_id and (s.user_id = auth.uid() or public.is_staff(auth.uid())))
-    when 'havs_log' then exists (select 1 from public.havs_logs h where h.id = _submission_id and (h.worker_id = auth.uid() or public.is_staff(auth.uid())))
-    when 'toolbox_talk' then exists (select 1 from public.toolbox_talks t where t.id = _submission_id and (t.briefer_id = auth.uid() or public.is_staff(auth.uid())))
-    when 'daily_briefing' then exists (select 1 from public.daily_briefings d where d.id = _submission_id and (d.briefer_id = auth.uid() or public.is_staff(auth.uid())))
-  end
+  SELECT public.can_access_submission_for_viewer(auth.uid(), _kind, _submission_id);
 $$;
 
 
 ALTER FUNCTION "public"."can_access_submission"("_kind" "public"."submission_kind", "_submission_id" "uuid") OWNER TO "postgres";
+
+
+CREATE OR REPLACE FUNCTION "public"."can_access_submission_for_viewer"("_viewer_id" "uuid", "_kind" "public"."submission_kind", "_submission_id" "uuid") RETURNS boolean
+    LANGUAGE "sql" STABLE SECURITY DEFINER
+    SET "search_path" TO 'public'
+    AS $$
+  SELECT CASE _kind
+    WHEN 'plant_inspection' THEN EXISTS (
+      SELECT 1 FROM public.plant_inspections p
+      WHERE p.id = _submission_id
+        AND public.can_view_job_linked_form(_viewer_id, p.project_id, p.worker_id)
+    )
+    WHEN 'vehicle_defect' THEN EXISTS (
+      SELECT 1 FROM public.vehicle_defects v
+      WHERE v.id = _submission_id
+        AND public.can_view_job_linked_form(_viewer_id, NULL, v.worker_id)
+    )
+    WHEN 'timesheet' THEN EXISTS (
+      SELECT 1 FROM public.timesheets t
+      WHERE t.id = _submission_id
+        AND public.can_view_job_linked_form(_viewer_id, NULL, t.worker_id)
+    )
+    WHEN 'rams_briefing' THEN EXISTS (
+      SELECT 1 FROM public.rams_briefings r
+      WHERE r.id = _submission_id
+        AND public.can_view_job_linked_form(_viewer_id, r.project_id, r.briefer_id)
+    )
+    WHEN 'starter' THEN EXISTS (
+      SELECT 1 FROM public.employee_starters s
+      WHERE s.id = _submission_id
+        AND public.can_view_job_linked_form(_viewer_id, NULL, s.user_id)
+    )
+    WHEN 'havs_log' THEN EXISTS (
+      SELECT 1 FROM public.havs_logs h
+      WHERE h.id = _submission_id
+        AND public.can_view_job_linked_form(_viewer_id, h.project_id, h.worker_id)
+    )
+    WHEN 'toolbox_talk' THEN EXISTS (
+      SELECT 1 FROM public.toolbox_talks t
+      WHERE t.id = _submission_id
+        AND public.can_view_job_linked_form(_viewer_id, t.project_id, t.briefer_id)
+    )
+    WHEN 'daily_briefing' THEN EXISTS (
+      SELECT 1 FROM public.daily_briefings d
+      WHERE d.id = _submission_id
+        AND public.can_view_job_linked_form(_viewer_id, d.project_id, d.briefer_id)
+    )
+    ELSE false
+  END;
+$$;
+
+
+ALTER FUNCTION "public"."can_access_submission_for_viewer"("_viewer_id" "uuid", "_kind" "public"."submission_kind", "_submission_id" "uuid") OWNER TO "postgres";
 
 
 CREATE OR REPLACE FUNCTION "public"."can_access_todo_item"("_user_id" "uuid", "_item_id" "uuid") RETURNS boolean
@@ -1044,6 +1080,17 @@ $$;
 ALTER FUNCTION "public"."can_delete_todo_list"("_user_id" "uuid", "_list_id" "uuid") OWNER TO "postgres";
 
 
+CREATE OR REPLACE FUNCTION "public"."can_download_submission_pdf"("_viewer_id" "uuid", "_kind" "public"."submission_kind", "_submission_id" "uuid") RETURNS boolean
+    LANGUAGE "sql" STABLE SECURITY DEFINER
+    SET "search_path" TO 'public'
+    AS $$
+  SELECT public.can_access_submission_for_viewer(_viewer_id, _kind, _submission_id);
+$$;
+
+
+ALTER FUNCTION "public"."can_download_submission_pdf"("_viewer_id" "uuid", "_kind" "public"."submission_kind", "_submission_id" "uuid") OWNER TO "postgres";
+
+
 CREATE OR REPLACE FUNCTION "public"."can_manage_or_submit_form_for"("_owner_id" "uuid") RETURNS boolean
     LANGUAGE "sql" STABLE SECURITY DEFINER
     SET "search_path" TO 'public'
@@ -1155,6 +1202,77 @@ $$;
 ALTER FUNCTION "public"."can_modify_todo_item"("_user_id" "uuid", "_item_id" "uuid") OWNER TO "postgres";
 
 
+CREATE OR REPLACE FUNCTION "public"."can_read_submission_asset_path"("_viewer_id" "uuid", "_path" "text") RETURNS boolean
+    LANGUAGE "sql" STABLE SECURITY DEFINER
+    SET "search_path" TO 'public'
+    AS $$
+  SELECT
+    coalesce((storage.foldername(_path))[1], '') = _viewer_id::text
+    OR public.is_staff(_viewer_id)
+    OR EXISTS (
+      SELECT 1 FROM public.submission_photos sp
+      WHERE sp.storage_path = _path
+        AND public.can_access_submission_for_viewer(_viewer_id, sp.kind, sp.submission_id)
+    )
+    OR EXISTS (
+      SELECT 1 FROM public.plant_inspections p
+      WHERE p.signature_url = _path
+        AND public.can_view_job_linked_form(_viewer_id, p.project_id, p.worker_id)
+    )
+    OR EXISTS (
+      SELECT 1 FROM public.vehicle_defects v
+      WHERE v.signature_url = _path
+        AND public.can_view_job_linked_form(_viewer_id, NULL, v.worker_id)
+    )
+    OR EXISTS (
+      SELECT 1 FROM public.timesheets t
+      WHERE t.signature_url = _path
+        AND public.can_view_job_linked_form(_viewer_id, NULL, t.worker_id)
+    )
+    OR EXISTS (
+      SELECT 1 FROM public.rams_briefings r
+      WHERE r.briefer_signature_url = _path
+        AND public.can_view_job_linked_form(_viewer_id, r.project_id, r.briefer_id)
+    )
+    OR EXISTS (
+      SELECT 1 FROM public.rams_attendees a
+      JOIN public.rams_briefings rb ON rb.id = a.briefing_id
+      WHERE (a.signature_url = _path OR a.briefer_signature_url = _path)
+        AND public.can_view_job_linked_form(_viewer_id, rb.project_id, rb.briefer_id)
+    )
+    OR EXISTS (
+      SELECT 1 FROM public.havs_logs h
+      WHERE h.signature_url = _path
+        AND public.can_view_job_linked_form(_viewer_id, h.project_id, h.worker_id)
+    )
+    OR EXISTS (
+      SELECT 1 FROM public.daily_briefings db
+      WHERE db.briefer_signature_url = _path
+        AND public.can_view_job_linked_form(_viewer_id, db.project_id, db.briefer_id)
+    )
+    OR EXISTS (
+      SELECT 1 FROM public.daily_briefing_attendees dba
+      JOIN public.daily_briefings db2 ON db2.id = dba.briefing_id
+      WHERE (dba.signature_url = _path OR dba.briefer_signature_url = _path)
+        AND public.can_view_job_linked_form(_viewer_id, db2.project_id, db2.briefer_id)
+    )
+    OR EXISTS (
+      SELECT 1 FROM public.toolbox_talks tt
+      WHERE tt.briefer_signature_url = _path
+        AND public.can_view_job_linked_form(_viewer_id, tt.project_id, tt.briefer_id)
+    )
+    OR EXISTS (
+      SELECT 1 FROM public.toolbox_attendees ta
+      JOIN public.toolbox_talks tt2 ON tt2.id = ta.talk_id
+      WHERE (ta.signature_url = _path OR ta.briefer_signature_url = _path)
+        AND public.can_view_job_linked_form(_viewer_id, tt2.project_id, tt2.briefer_id)
+    );
+$$;
+
+
+ALTER FUNCTION "public"."can_read_submission_asset_path"("_viewer_id" "uuid", "_path" "text") OWNER TO "postgres";
+
+
 CREATE OR REPLACE FUNCTION "public"."can_submit_for"("_owner_id" "uuid") RETURNS boolean
     LANGUAGE "sql" STABLE SECURITY DEFINER
     SET "search_path" TO 'public'
@@ -1222,6 +1340,24 @@ $$;
 
 
 ALTER FUNCTION "public"."can_view_holiday"("_viewer_id" "uuid", "_owner_id" "uuid") OWNER TO "postgres";
+
+
+CREATE OR REPLACE FUNCTION "public"."can_view_job_linked_form"("_viewer_id" "uuid", "_project_id" "uuid", "_owner_id" "uuid") RETURNS boolean
+    LANGUAGE "sql" STABLE SECURITY DEFINER
+    SET "search_path" TO 'public'
+    AS $$
+  SELECT
+    (_owner_id IS NOT NULL AND _viewer_id = _owner_id)
+    OR public.is_staff(_viewer_id)
+    OR public.can_view_general_submission(_viewer_id, _owner_id)
+    OR (
+      _project_id IS NOT NULL
+      AND public.is_assigned_to_project(_viewer_id, _project_id)
+    );
+$$;
+
+
+ALTER FUNCTION "public"."can_view_job_linked_form"("_viewer_id" "uuid", "_project_id" "uuid", "_owner_id" "uuid") OWNER TO "postgres";
 
 
 CREATE OR REPLACE FUNCTION "public"."can_view_starter"("_viewer_id" "uuid", "_owner_id" "uuid") RETURNS boolean
@@ -5397,6 +5533,23 @@ $$;
 ALTER FUNCTION "public"."set_updated_by"() OWNER TO "postgres";
 
 
+CREATE OR REPLACE FUNCTION "public"."shares_project_with"("_user_id" "uuid", "_other_user_id" "uuid") RETURNS boolean
+    LANGUAGE "sql" STABLE SECURITY DEFINER
+    SET "search_path" TO 'public'
+    AS $$
+  SELECT EXISTS (
+    SELECT 1
+    FROM public.project_assignments a
+    JOIN public.project_assignments b ON a.project_id = b.project_id
+    WHERE a.user_id = _user_id
+      AND b.user_id = _other_user_id
+  );
+$$;
+
+
+ALTER FUNCTION "public"."shares_project_with"("_user_id" "uuid", "_other_user_id" "uuid") OWNER TO "postgres";
+
+
 CREATE OR REPLACE FUNCTION "public"."shares_synced_subcontractor_staff_profile"("_viewer_id" "uuid", "_profile_id" "uuid") RETURNS boolean
     LANGUAGE "sql" STABLE SECURITY DEFINER
     SET "search_path" TO 'public'
@@ -8762,7 +8915,7 @@ CREATE POLICY "db_att owner write" ON "public"."daily_briefing_attendees" TO "au
 
 CREATE POLICY "db_att read" ON "public"."daily_briefing_attendees" FOR SELECT TO "authenticated" USING ((EXISTS ( SELECT 1
    FROM "public"."daily_briefings" "b"
-  WHERE (("b"."id" = "daily_briefing_attendees"."briefing_id") AND (("b"."briefer_id" = "auth"."uid"()) OR "public"."is_staff"("auth"."uid"()))))));
+  WHERE (("b"."id" = "daily_briefing_attendees"."briefing_id") AND "public"."can_view_job_linked_form"("auth"."uid"(), "b"."project_id", "b"."briefer_id")))));
 
 
 
@@ -8776,7 +8929,7 @@ CREATE POLICY "db_haz owner write" ON "public"."daily_briefing_hazards" TO "auth
 
 CREATE POLICY "db_haz read" ON "public"."daily_briefing_hazards" FOR SELECT TO "authenticated" USING ((EXISTS ( SELECT 1
    FROM "public"."daily_briefings" "b"
-  WHERE (("b"."id" = "daily_briefing_hazards"."briefing_id") AND (("b"."briefer_id" = "auth"."uid"()) OR "public"."is_staff"("auth"."uid"()))))));
+  WHERE (("b"."id" = "daily_briefing_hazards"."briefing_id") AND "public"."can_view_job_linked_form"("auth"."uid"(), "b"."project_id", "b"."briefer_id")))));
 
 
 
@@ -8820,7 +8973,7 @@ CREATE POLICY "havs_items internal_manager read" ON "public"."havs_log_items" FO
 
 CREATE POLICY "havs_items read" ON "public"."havs_log_items" FOR SELECT TO "authenticated" USING ((EXISTS ( SELECT 1
    FROM "public"."havs_logs" "h"
-  WHERE (("h"."id" = "havs_log_items"."log_id") AND "public"."can_manage_submission"("h"."worker_id")))));
+  WHERE (("h"."id" = "havs_log_items"."log_id") AND "public"."can_view_job_linked_form"("auth"."uid"(), "h"."project_id", "h"."worker_id")))));
 
 
 
@@ -8966,7 +9119,7 @@ CREATE POLICY "pi_items owner write" ON "public"."plant_inspection_items" TO "au
 
 CREATE POLICY "pi_items read" ON "public"."plant_inspection_items" FOR SELECT TO "authenticated" USING ((EXISTS ( SELECT 1
    FROM "public"."plant_inspections" "p"
-  WHERE (("p"."id" = "plant_inspection_items"."inspection_id") AND (("p"."worker_id" = "auth"."uid"()) OR "public"."is_staff"("auth"."uid"()))))));
+  WHERE (("p"."id" = "plant_inspection_items"."inspection_id") AND "public"."can_view_job_linked_form"("auth"."uid"(), "p"."project_id", "p"."worker_id")))));
 
 
 
@@ -8994,7 +9147,7 @@ CREATE POLICY "profiles admin all" ON "public"."profiles" TO "authenticated" USI
 
 
 
-CREATE POLICY "profiles self read" ON "public"."profiles" FOR SELECT TO "authenticated" USING ((("id" = "auth"."uid"()) OR "public"."is_staff"("auth"."uid"()) OR "public"."shares_todo_list_with"("auth"."uid"(), "id") OR "public"."shares_synced_subcontractor_staff_profile"("auth"."uid"(), "id")));
+CREATE POLICY "profiles self read" ON "public"."profiles" FOR SELECT TO "authenticated" USING ((("id" = "auth"."uid"()) OR "public"."is_staff"("auth"."uid"()) OR "public"."shares_todo_list_with"("auth"."uid"(), "id") OR "public"."shares_project_with"("auth"."uid"(), "id")));
 
 
 
@@ -9072,8 +9225,8 @@ CREATE POLICY "rams_att owner write" ON "public"."rams_attendees" TO "authentica
 
 
 CREATE POLICY "rams_att read" ON "public"."rams_attendees" FOR SELECT TO "authenticated" USING ((EXISTS ( SELECT 1
-   FROM "public"."rams_briefings" "b"
-  WHERE (("b"."id" = "rams_attendees"."briefing_id") AND (("b"."briefer_id" = "auth"."uid"()) OR "public"."is_staff"("auth"."uid"()))))));
+   FROM "public"."rams_briefings" "r"
+  WHERE (("r"."id" = "rams_attendees"."briefing_id") AND "public"."can_view_job_linked_form"("auth"."uid"(), "r"."project_id", "r"."briefer_id")))));
 
 
 
@@ -9212,7 +9365,7 @@ CREATE POLICY "tbx_att owner write" ON "public"."toolbox_attendees" TO "authenti
 
 CREATE POLICY "tbx_att read" ON "public"."toolbox_attendees" FOR SELECT TO "authenticated" USING ((EXISTS ( SELECT 1
    FROM "public"."toolbox_talks" "t"
-  WHERE (("t"."id" = "toolbox_attendees"."talk_id") AND (("t"."briefer_id" = "auth"."uid"()) OR "public"."is_staff"("auth"."uid"()))))));
+  WHERE (("t"."id" = "toolbox_attendees"."talk_id") AND "public"."can_view_job_linked_form"("auth"."uid"(), "t"."project_id", "t"."briefer_id")))));
 
 
 
@@ -9815,6 +9968,12 @@ GRANT ALL ON FUNCTION "public"."can_access_submission"("_kind" "public"."submiss
 
 
 
+REVOKE ALL ON FUNCTION "public"."can_access_submission_for_viewer"("_viewer_id" "uuid", "_kind" "public"."submission_kind", "_submission_id" "uuid") FROM PUBLIC;
+GRANT ALL ON FUNCTION "public"."can_access_submission_for_viewer"("_viewer_id" "uuid", "_kind" "public"."submission_kind", "_submission_id" "uuid") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."can_access_submission_for_viewer"("_viewer_id" "uuid", "_kind" "public"."submission_kind", "_submission_id" "uuid") TO "service_role";
+
+
+
 REVOKE ALL ON FUNCTION "public"."can_access_todo_item"("_user_id" "uuid", "_item_id" "uuid") FROM PUBLIC;
 GRANT ALL ON FUNCTION "public"."can_access_todo_item"("_user_id" "uuid", "_item_id" "uuid") TO "authenticated";
 GRANT ALL ON FUNCTION "public"."can_access_todo_item"("_user_id" "uuid", "_item_id" "uuid") TO "service_role";
@@ -9842,6 +10001,12 @@ GRANT ALL ON FUNCTION "public"."can_complete_todo_item"("_user_id" "uuid", "_ite
 REVOKE ALL ON FUNCTION "public"."can_delete_todo_list"("_user_id" "uuid", "_list_id" "uuid") FROM PUBLIC;
 GRANT ALL ON FUNCTION "public"."can_delete_todo_list"("_user_id" "uuid", "_list_id" "uuid") TO "authenticated";
 GRANT ALL ON FUNCTION "public"."can_delete_todo_list"("_user_id" "uuid", "_list_id" "uuid") TO "service_role";
+
+
+
+REVOKE ALL ON FUNCTION "public"."can_download_submission_pdf"("_viewer_id" "uuid", "_kind" "public"."submission_kind", "_submission_id" "uuid") FROM PUBLIC;
+GRANT ALL ON FUNCTION "public"."can_download_submission_pdf"("_viewer_id" "uuid", "_kind" "public"."submission_kind", "_submission_id" "uuid") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."can_download_submission_pdf"("_viewer_id" "uuid", "_kind" "public"."submission_kind", "_submission_id" "uuid") TO "service_role";
 
 
 
@@ -9875,6 +10040,12 @@ GRANT ALL ON FUNCTION "public"."can_modify_todo_item"("_user_id" "uuid", "_item_
 
 
 
+REVOKE ALL ON FUNCTION "public"."can_read_submission_asset_path"("_viewer_id" "uuid", "_path" "text") FROM PUBLIC;
+GRANT ALL ON FUNCTION "public"."can_read_submission_asset_path"("_viewer_id" "uuid", "_path" "text") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."can_read_submission_asset_path"("_viewer_id" "uuid", "_path" "text") TO "service_role";
+
+
+
 REVOKE ALL ON FUNCTION "public"."can_submit_for"("_owner_id" "uuid") FROM PUBLIC;
 GRANT ALL ON FUNCTION "public"."can_submit_for"("_owner_id" "uuid") TO "authenticated";
 GRANT ALL ON FUNCTION "public"."can_submit_for"("_owner_id" "uuid") TO "service_role";
@@ -9896,6 +10067,12 @@ GRANT ALL ON FUNCTION "public"."can_view_general_submission"("_viewer_id" "uuid"
 REVOKE ALL ON FUNCTION "public"."can_view_holiday"("_viewer_id" "uuid", "_owner_id" "uuid") FROM PUBLIC;
 GRANT ALL ON FUNCTION "public"."can_view_holiday"("_viewer_id" "uuid", "_owner_id" "uuid") TO "authenticated";
 GRANT ALL ON FUNCTION "public"."can_view_holiday"("_viewer_id" "uuid", "_owner_id" "uuid") TO "service_role";
+
+
+
+REVOKE ALL ON FUNCTION "public"."can_view_job_linked_form"("_viewer_id" "uuid", "_project_id" "uuid", "_owner_id" "uuid") FROM PUBLIC;
+GRANT ALL ON FUNCTION "public"."can_view_job_linked_form"("_viewer_id" "uuid", "_project_id" "uuid", "_owner_id" "uuid") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."can_view_job_linked_form"("_viewer_id" "uuid", "_project_id" "uuid", "_owner_id" "uuid") TO "service_role";
 
 
 
@@ -10459,6 +10636,12 @@ GRANT ALL ON FUNCTION "public"."set_updated_at_havs_tools"() TO "service_role";
 
 REVOKE ALL ON FUNCTION "public"."set_updated_by"() FROM PUBLIC;
 GRANT ALL ON FUNCTION "public"."set_updated_by"() TO "service_role";
+
+
+
+REVOKE ALL ON FUNCTION "public"."shares_project_with"("_user_id" "uuid", "_other_user_id" "uuid") FROM PUBLIC;
+GRANT ALL ON FUNCTION "public"."shares_project_with"("_user_id" "uuid", "_other_user_id" "uuid") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."shares_project_with"("_user_id" "uuid", "_other_user_id" "uuid") TO "service_role";
 
 
 
