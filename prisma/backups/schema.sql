@@ -6510,6 +6510,29 @@ CREATE TABLE IF NOT EXISTS "public"."integration_oauth_providers" (
 ALTER TABLE "public"."integration_oauth_providers" OWNER TO "postgres";
 
 
+CREATE TABLE IF NOT EXISTS "public"."integration_portal_accounts" (
+    "id" "uuid" DEFAULT "gen_random_uuid"() NOT NULL,
+    "label" "text" NOT NULL,
+    "portal_type" "text" DEFAULT 'velocityfleet'::"text" NOT NULL,
+    "portal_domain" "text" NOT NULL,
+    "username" "text" NOT NULL,
+    "password_secret" "text",
+    "refresh_token_secret" "text",
+    "has_credentials" boolean DEFAULT false NOT NULL,
+    "is_active" boolean DEFAULT true NOT NULL,
+    "notes" "text",
+    "config" "jsonb" DEFAULT '{}'::"jsonb" NOT NULL,
+    "last_test_ok" boolean,
+    "last_test_at" timestamp with time zone,
+    "last_test_error" "text",
+    "created_at" timestamp with time zone DEFAULT "now"() NOT NULL,
+    "updated_at" timestamp with time zone DEFAULT "now"() NOT NULL
+);
+
+
+ALTER TABLE "public"."integration_portal_accounts" OWNER TO "postgres";
+
+
 CREATE TABLE IF NOT EXISTS "public"."integration_storage_backends" (
     "id" "uuid" DEFAULT "gen_random_uuid"() NOT NULL,
     "label" "text" NOT NULL,
@@ -7375,6 +7398,11 @@ ALTER TABLE ONLY "public"."integration_oauth_providers"
 
 
 
+ALTER TABLE ONLY "public"."integration_portal_accounts"
+    ADD CONSTRAINT "integration_portal_accounts_pkey" PRIMARY KEY ("id");
+
+
+
 ALTER TABLE ONLY "public"."integration_storage_backends"
     ADD CONSTRAINT "integration_storage_backends_pkey" PRIMARY KEY ("id");
 
@@ -8109,6 +8137,10 @@ CREATE OR REPLACE TRIGGER "trg_integration_email_accounts_updated" BEFORE UPDATE
 
 
 CREATE OR REPLACE TRIGGER "trg_integration_oauth_providers_updated" BEFORE UPDATE ON "public"."integration_oauth_providers" FOR EACH ROW EXECUTE FUNCTION "public"."update_updated_at_column"();
+
+
+
+CREATE OR REPLACE TRIGGER "trg_integration_portal_accounts_updated" BEFORE UPDATE ON "public"."integration_portal_accounts" FOR EACH ROW EXECUTE FUNCTION "public"."update_updated_at_column"();
 
 
 
@@ -9007,6 +9039,9 @@ ALTER TABLE "public"."integration_email_accounts" ENABLE ROW LEVEL SECURITY;
 ALTER TABLE "public"."integration_oauth_providers" ENABLE ROW LEVEL SECURITY;
 
 
+ALTER TABLE "public"."integration_portal_accounts" ENABLE ROW LEVEL SECURITY;
+
+
 ALTER TABLE "public"."integration_storage_backends" ENABLE ROW LEVEL SECURITY;
 
 
@@ -9316,6 +9351,10 @@ CREATE POLICY "super_admin manage email accounts" ON "public"."integration_email
 
 
 CREATE POLICY "super_admin manage oauth providers" ON "public"."integration_oauth_providers" TO "authenticated" USING ("public"."has_role_app_role_deprecated"("auth"."uid"(), 'super_admin'::"public"."app_role")) WITH CHECK ("public"."has_role_app_role_deprecated"("auth"."uid"(), 'super_admin'::"public"."app_role"));
+
+
+
+CREATE POLICY "super_admin manage portal accounts" ON "public"."integration_portal_accounts" TO "authenticated" USING ("public"."has_role"("auth"."uid"(), 'super_admin'::"text")) WITH CHECK ("public"."has_role"("auth"."uid"(), 'super_admin'::"text"));
 
 
 
@@ -10943,6 +10982,12 @@ GRANT ALL ON TABLE "public"."integration_email_accounts" TO "service_role";
 GRANT ALL ON TABLE "public"."integration_oauth_providers" TO "anon";
 GRANT ALL ON TABLE "public"."integration_oauth_providers" TO "authenticated";
 GRANT ALL ON TABLE "public"."integration_oauth_providers" TO "service_role";
+
+
+
+GRANT ALL ON TABLE "public"."integration_portal_accounts" TO "anon";
+GRANT ALL ON TABLE "public"."integration_portal_accounts" TO "authenticated";
+GRANT ALL ON TABLE "public"."integration_portal_accounts" TO "service_role";
 
 
 
