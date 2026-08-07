@@ -5883,7 +5883,7 @@ CREATE OR REPLACE FUNCTION "public"."trigger_cost_scan"("p_url" "text", "p_apike
     AS $$
 BEGIN
   IF auth.uid() IS NOT NULL
-     AND NOT public.has_role(auth.uid(), 'super_admin') THEN
+     AND NOT public.has_permission(auth.uid(), 'costs.manual_scan', false) THEN
     RAISE EXCEPTION 'Not allowed to trigger cost scan';
   END IF;
 
@@ -6809,11 +6809,21 @@ CREATE TABLE IF NOT EXISTS "public"."profiles" (
     "last_active_at" timestamp with time zone,
     "recovery_email" "text",
     "mfa_enabled" boolean DEFAULT false NOT NULL,
-    "notification_prompt_seen" boolean DEFAULT false NOT NULL
+    "notification_prompt_seen" boolean DEFAULT false NOT NULL,
+    "archived_at" timestamp with time zone,
+    "archived_by" "uuid"
 );
 
 
 ALTER TABLE "public"."profiles" OWNER TO "postgres";
+
+
+COMMENT ON COLUMN "public"."profiles"."archived_at" IS 'When set, the account is archived (hidden from active lists; profile and history retained).';
+
+
+
+COMMENT ON COLUMN "public"."profiles"."archived_by" IS 'Profile id of the admin/manager who archived this account.';
+
 
 
 CREATE TABLE IF NOT EXISTS "public"."project_assignments" (
@@ -7924,6 +7934,10 @@ CREATE INDEX "plant_inspections_worker_id_inspection_date_idx" ON "public"."plan
 
 
 
+CREATE INDEX "profiles_archived_at_idx" ON "public"."profiles" USING "btree" ("archived_at") WHERE ("archived_at" IS NOT NULL);
+
+
+
 CREATE INDEX "project_assignments_project_idx" ON "public"."project_assignments" USING "btree" ("project_id");
 
 
@@ -8447,6 +8461,11 @@ ALTER TABLE ONLY "public"."plant_inspections"
 
 ALTER TABLE ONLY "public"."plant_inspections"
     ADD CONSTRAINT "plant_inspections_worker_id_fkey" FOREIGN KEY ("worker_id") REFERENCES "auth"."users"("id") ON DELETE SET NULL;
+
+
+
+ALTER TABLE ONLY "public"."profiles"
+    ADD CONSTRAINT "profiles_archived_by_fkey" FOREIGN KEY ("archived_by") REFERENCES "public"."profiles"("id") ON DELETE SET NULL;
 
 
 
