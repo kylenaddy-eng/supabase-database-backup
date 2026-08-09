@@ -1384,6 +1384,32 @@ $$;
 ALTER FUNCTION "public"."can_submit_form_for"("_owner_id" "uuid") OWNER TO "postgres";
 
 
+CREATE OR REPLACE FUNCTION "public"."can_submit_timesheet_for"("_worker_id" "uuid") RETURNS boolean
+    LANGUAGE "sql" STABLE SECURITY DEFINER
+    SET "search_path" TO 'public'
+    AS $$
+  SELECT
+    _worker_id = auth.uid()
+    OR (
+      public.has_permission(auth.uid(), 'submissions.submit_timesheets_on_behalf', false)
+      AND (
+        public.has_permission(auth.uid(), 'data.scope_org_wide', false)
+        OR (
+          public.user_subcontractor(auth.uid()) IS NOT NULL
+          AND public.user_subcontractor(auth.uid()) = public.user_subcontractor(_worker_id)
+        )
+      )
+      AND (
+        public.has_permission(auth.uid(), 'data.scope_org_wide', false)
+        OR NOT public.is_staff(_worker_id)
+      )
+    );
+$$;
+
+
+ALTER FUNCTION "public"."can_submit_timesheet_for"("_worker_id" "uuid") OWNER TO "postgres";
+
+
 CREATE OR REPLACE FUNCTION "public"."can_view_general_submission"("_viewer_id" "uuid", "_owner_id" "uuid") RETURNS boolean
     LANGUAGE "sql" STABLE SECURITY DEFINER
     SET "search_path" TO 'public'
@@ -5828,17 +5854,17 @@ BEGIN
       NEW.approved_by := COALESCE(NEW.approved_by, NEW.worker_id);
 
     -- Submitted by someone else on the worker's behalf:
-    --   * admin → auto-approve
-    --   * manager in same subcontractor as a non-staff worker → auto-approve
-    ELSIF v_actor IS NOT NULL AND v_actor <> NEW.worker_id AND (
-      public.has_role(v_actor, 'admin')
-      OR (
-        public.has_role(v_actor, 'manager')
-        AND NOT public.is_staff(NEW.worker_id)
-        AND public.user_subcontractor(v_actor) IS NOT NULL
-        AND public.user_subcontractor(v_actor) = public.user_subcontractor(NEW.worker_id)
+    ELSIF v_actor IS NOT NULL AND v_actor <> NEW.worker_id
+      AND public.has_permission(v_actor, 'submissions.submit_timesheets_on_behalf', false)
+      AND (
+        public.has_permission(v_actor, 'data.scope_org_wide', false)
+        OR (
+          public.user_subcontractor(v_actor) IS NOT NULL
+          AND public.user_subcontractor(v_actor) = public.user_subcontractor(NEW.worker_id)
+          AND NOT public.is_staff(NEW.worker_id)
+        )
       )
-    ) THEN
+    THEN
       NEW.status := 'approved';
       NEW.approved_at := COALESCE(NEW.approved_at, now());
       NEW.approved_by := COALESCE(NEW.approved_by, v_actor);
@@ -9488,7 +9514,7 @@ CREATE POLICY "timesheets delete admin owner-unapproved or manager scope" ON "pu
 
 
 
-CREATE POLICY "timesheets insert owner or manager scope" ON "public"."timesheets" FOR INSERT TO "authenticated" WITH CHECK (("public"."can_submit_for"("worker_id") OR ("public"."has_role_app_role_deprecated"("auth"."uid"(), 'manager'::"public"."app_role") AND (NOT "public"."is_staff"("worker_id")) AND ("public"."user_subcontractor"("auth"."uid"()) IS NOT NULL) AND ("public"."user_subcontractor"("auth"."uid"()) = "public"."user_subcontractor"("worker_id")))));
+CREATE POLICY "timesheets insert owner or scoped on behalf" ON "public"."timesheets" FOR INSERT TO "authenticated" WITH CHECK ("public"."can_submit_timesheet_for"("worker_id"));
 
 
 
@@ -10150,6 +10176,12 @@ GRANT ALL ON FUNCTION "public"."can_submit_for"("_owner_id" "uuid") TO "service_
 REVOKE ALL ON FUNCTION "public"."can_submit_form_for"("_owner_id" "uuid") FROM PUBLIC;
 GRANT ALL ON FUNCTION "public"."can_submit_form_for"("_owner_id" "uuid") TO "authenticated";
 GRANT ALL ON FUNCTION "public"."can_submit_form_for"("_owner_id" "uuid") TO "service_role";
+
+
+
+REVOKE ALL ON FUNCTION "public"."can_submit_timesheet_for"("_worker_id" "uuid") FROM PUBLIC;
+GRANT ALL ON FUNCTION "public"."can_submit_timesheet_for"("_worker_id" "uuid") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."can_submit_timesheet_for"("_worker_id" "uuid") TO "service_role";
 
 
 
@@ -11162,6 +11194,10 @@ GRANT SELECT("mfa_enabled") ON TABLE "public"."profiles" TO "authenticated";
 
 
 GRANT SELECT("notification_prompt_seen") ON TABLE "public"."profiles" TO "authenticated";
+
+
+
+GRANT SELECT("archived_at") ON TABLE "public"."profiles" TO "authenticated";
 
 
 
