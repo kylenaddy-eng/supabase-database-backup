@@ -2767,7 +2767,8 @@ DECLARE
 BEGIN
   v_changed := (NEW.start_date IS DISTINCT FROM OLD.start_date)
             OR (NEW.end_date   IS DISTINCT FROM OLD.end_date)
-            OR (NEW.note       IS DISTINCT FROM OLD.note);
+            OR (NEW.note       IS DISTINCT FROM OLD.note)
+            OR OLD.status = 'rejected';
 
   IF NOT v_changed THEN
     RETURN NEW;
@@ -5974,6 +5975,46 @@ $$;
 
 
 ALTER FUNCTION "public"."trusted_supplier_email_domain"("p_from" "text") OWNER TO "postgres";
+
+
+CREATE OR REPLACE FUNCTION "public"."undo_cost_invoices_paid"("p_snapshot" "jsonb") RETURNS bigint
+    LANGUAGE "plpgsql" SECURITY DEFINER
+    SET "search_path" TO 'public'
+    AS $$
+DECLARE
+  v_count bigint;
+BEGIN
+  PERFORM public.assert_rpc_admin();
+
+  IF p_snapshot IS NULL OR jsonb_typeof(p_snapshot) <> 'array' OR jsonb_array_length(p_snapshot) = 0 THEN
+    RETURN 0;
+  END IF;
+
+  WITH entries AS (
+    SELECT
+      (e->>'id')::uuid AS id,
+      CASE
+        WHEN e->>'paid_at' IS NULL OR e->>'paid_at' = 'null' THEN NULL
+        ELSE (e->>'paid_at')::timestamptz
+      END AS paid_at
+    FROM jsonb_array_elements(p_snapshot) AS e
+    WHERE e ? 'id'
+  ),
+  upd AS (
+    UPDATE public.cost_invoices ci
+    SET paid_at = entries.paid_at
+    FROM entries
+    WHERE ci.id = entries.id
+    RETURNING ci.id
+  )
+  SELECT count(*)::bigint INTO v_count FROM upd;
+
+  RETURN v_count;
+END;
+$$;
+
+
+ALTER FUNCTION "public"."undo_cost_invoices_paid"("p_snapshot" "jsonb") OWNER TO "postgres";
 
 
 CREATE OR REPLACE FUNCTION "public"."update_cost_payment_remittance_nas_path"("p_invoice_ids" "uuid"[], "p_nas_path" "text") RETURNS "uuid"
@@ -10841,6 +10882,13 @@ GRANT ALL ON FUNCTION "public"."trigger_statement_scan"("p_url" "text", "p_apike
 GRANT ALL ON FUNCTION "public"."trusted_supplier_email_domain"("p_from" "text") TO "anon";
 GRANT ALL ON FUNCTION "public"."trusted_supplier_email_domain"("p_from" "text") TO "authenticated";
 GRANT ALL ON FUNCTION "public"."trusted_supplier_email_domain"("p_from" "text") TO "service_role";
+
+
+
+REVOKE ALL ON FUNCTION "public"."undo_cost_invoices_paid"("p_snapshot" "jsonb") FROM PUBLIC;
+GRANT ALL ON FUNCTION "public"."undo_cost_invoices_paid"("p_snapshot" "jsonb") TO "anon";
+GRANT ALL ON FUNCTION "public"."undo_cost_invoices_paid"("p_snapshot" "jsonb") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."undo_cost_invoices_paid"("p_snapshot" "jsonb") TO "service_role";
 
 
 
