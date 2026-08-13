@@ -921,14 +921,6 @@ BEGIN
     WHEN 'daily_briefings' THEN 'daily briefing'
     WHEN 'employee_starters' THEN 'starter form'
     WHEN 'holidays' THEN 'holiday request'
-    WHEN 'timesheet_days' THEN 'timesheet line'
-    WHEN 'plant_inspection_items' THEN 'plant inspection line'
-    WHEN 'vehicle_defect_items' THEN 'vehicle defect line'
-    WHEN 'rams_attendees' THEN 'RAMS attendee'
-    WHEN 'havs_log_items' THEN 'HAVS log line'
-    WHEN 'toolbox_attendees' THEN 'toolbox attendee'
-    WHEN 'daily_briefing_hazards' THEN 'daily briefing hazard'
-    WHEN 'daily_briefing_attendees' THEN 'daily briefing attendee'
     WHEN 'clients' THEN 'client'
     WHEN 'projects' THEN 'project'
     WHEN 'vehicles' THEN 'vehicle'
@@ -936,18 +928,22 @@ BEGIN
     WHEN 'subcontractors' THEN 'subcontractor'
     WHEN 'havs_tools' THEN 'HAVS tool'
     WHEN 'invoices' THEN 'outgoing invoice'
-    WHEN 'invoice_lines' THEN 'outgoing invoice line'
     WHEN 'cost_invoices' THEN 'cost invoice'
-    WHEN 'cost_invoice_splits' THEN 'cost invoice split line'
     WHEN 'profiles' THEN 'user'
     ELSE p_table
   END;
 
   IF p_action = 'insert' THEN
+    IF public.audit_is_submission_parent(p_table) THEN
+      RETURN 'Submitted ' || v_label;
+    END IF;
     IF p_table = 'holidays' THEN RETURN 'Submitted holiday request'; END IF;
     RETURN 'Added ' || v_label;
   ELSIF p_action = 'delete' THEN
     IF p_table = 'holidays' THEN RETURN 'Deleted holiday request'; END IF;
+    IF public.audit_is_submission_parent(p_table) THEN
+      RETURN 'Deleted ' || v_label;
+    END IF;
     RETURN 'Removed ' || v_label;
   END IF;
 
@@ -1006,12 +1002,282 @@ BEGIN
     END IF;
   END IF;
 
+  IF public.audit_is_submission_parent(p_table) THEN
+    RETURN 'Updated ' || v_label;
+  END IF;
+
   RETURN 'Updated ' || v_label;
 END;
 $$;
 
 
 ALTER FUNCTION "public"."audit_build_summary"("p_table" "text", "p_action" "text", "p_new" "anyelement", "p_old" "anyelement", "p_changes" "jsonb") OWNER TO "postgres";
+
+
+CREATE OR REPLACE FUNCTION "public"."audit_bulk_cost_invoices_summary"("p_ids" "uuid"[], "p_paid" boolean, "p_mode" "text" DEFAULT 'marked_paid'::"text") RETURNS "text"
+    LANGUAGE "plpgsql" STABLE
+    AS $$
+DECLARE
+  v_count integer;
+  v_labels text[];
+  v_preview text;
+BEGIN
+  v_count := coalesce(array_length(p_ids, 1), 0);
+  IF v_count = 0 THEN
+    RETURN 'No cost invoices changed';
+  END IF;
+
+  SELECT array_agg(x.label ORDER BY x.label)
+  INTO v_labels
+  FROM (
+    SELECT public.audit_cost_invoice_label(ci.company_name, ci.invoice_number) AS label
+    FROM public.cost_invoices ci
+    WHERE ci.id = ANY (p_ids)
+    ORDER BY ci.company_name, ci.invoice_number, ci.id
+    LIMIT 5
+  ) x;
+
+  v_preview := array_to_string(v_labels, ', ');
+
+  IF p_mode = 'restored_paid' THEN
+  RETURN format('Restored paid date on %s cost invoice%s%s',
+    v_count,
+    CASE WHEN v_count = 1 THEN '' ELSE 's' END,
+    CASE WHEN v_preview <> '' THEN ': ' || v_preview ELSE '' END
+  );
+  END IF;
+
+  IF p_paid THEN
+    RETURN format('Marked %s cost invoice%s as paid%s',
+      v_count,
+      CASE WHEN v_count = 1 THEN '' ELSE 's' END,
+      CASE WHEN v_preview <> '' THEN ': ' || v_preview ELSE '' END
+    );
+  END IF;
+
+  RETURN format('Marked %s cost invoice%s as unpaid%s',
+    v_count,
+    CASE WHEN v_count = 1 THEN '' ELSE 's' END,
+    CASE WHEN v_preview <> '' THEN ': ' || v_preview ELSE '' END
+  );
+END;
+$$;
+
+
+ALTER FUNCTION "public"."audit_bulk_cost_invoices_summary"("p_ids" "uuid"[], "p_paid" boolean, "p_mode" "text") OWNER TO "postgres";
+
+
+CREATE OR REPLACE FUNCTION "public"."audit_cost_invoice_label"("p_company_name" "text", "p_invoice_number" "text") RETURNS "text"
+    LANGUAGE "sql" IMMUTABLE
+    AS $$
+  SELECT coalesce(nullif(trim(p_company_name), ''), 'Unknown supplier')
+    || CASE
+      WHEN nullif(trim(p_invoice_number), '') IS NOT NULL THEN ' (' || trim(p_invoice_number) || ')'
+      ELSE ''
+    END;
+$$;
+
+
+ALTER FUNCTION "public"."audit_cost_invoice_label"("p_company_name" "text", "p_invoice_number" "text") OWNER TO "postgres";
+
+
+CREATE OR REPLACE FUNCTION "public"."audit_cost_invoice_labels_json"("p_ids" "uuid"[]) RETURNS "jsonb"
+    LANGUAGE "sql" STABLE
+    AS $$
+  SELECT coalesce(
+    jsonb_agg(
+      jsonb_build_object(
+        'id', ci.id,
+        'label', public.audit_cost_invoice_label(ci.company_name, ci.invoice_number)
+      )
+      ORDER BY ci.company_name, ci.invoice_number, ci.id
+    ),
+    '[]'::jsonb
+  )
+  FROM public.cost_invoices ci
+  WHERE p_ids IS NOT NULL AND ci.id = ANY (p_ids);
+$$;
+
+
+ALTER FUNCTION "public"."audit_cost_invoice_labels_json"("p_ids" "uuid"[]) OWNER TO "postgres";
+
+
+CREATE OR REPLACE FUNCTION "public"."audit_enrich_with_entity_label"("p_table" "text", "p_summary" "text", "p_metadata" "jsonb", "p_row" "jsonb") RETURNS TABLE("out_summary" "text", "out_metadata" "jsonb")
+    LANGUAGE "plpgsql" STABLE
+    AS $$
+DECLARE
+  v_label text;
+  v_meta jsonb;
+  v_summary text;
+BEGIN
+  v_summary := p_summary;
+  v_meta := coalesce(p_metadata, '{}'::jsonb);
+
+  IF public.audit_is_submission_parent(p_table) THEN
+    RETURN QUERY SELECT v_summary, v_meta;
+    RETURN;
+  END IF;
+
+  IF coalesce(v_meta ->> 'bulk_action', '') <> '' THEN
+    RETURN QUERY SELECT v_summary, v_meta;
+    RETURN;
+  END IF;
+
+  v_label := public.audit_entity_label(p_table, p_row);
+  IF v_label IS NULL OR trim(v_label) = '' THEN
+    RETURN QUERY SELECT v_summary, v_meta;
+    RETURN;
+  END IF;
+
+  IF v_summary NOT ILIKE '%' || v_label || '%' THEN
+    v_summary := v_summary || ' — ' || v_label;
+  END IF;
+
+  v_meta := v_meta || jsonb_build_object('entity_label', v_label);
+  RETURN QUERY SELECT v_summary, v_meta;
+END;
+$$;
+
+
+ALTER FUNCTION "public"."audit_enrich_with_entity_label"("p_table" "text", "p_summary" "text", "p_metadata" "jsonb", "p_row" "jsonb") OWNER TO "postgres";
+
+
+CREATE OR REPLACE FUNCTION "public"."audit_entity_label"("p_table" "text", "p_row" "jsonb") RETURNS "text"
+    LANGUAGE "plpgsql" STABLE
+    AS $$
+DECLARE
+  v text;
+  v_desc text;
+BEGIN
+  IF p_row IS NULL THEN
+    RETURN NULL;
+  END IF;
+
+  CASE p_table
+    WHEN 'cost_invoices' THEN
+      RETURN public.audit_cost_invoice_label(
+        coalesce(p_row ->> 'company_name', ''),
+        coalesce(p_row ->> 'invoice_number', '')
+      );
+
+    WHEN 'invoices' THEN
+      v := coalesce(nullif(trim(p_row ->> 'client_name_snapshot'), ''), 'Unknown client');
+      IF nullif(trim(p_row ->> 'invoice_number'), '') IS NOT NULL THEN
+        RETURN v || ' (#' || trim(p_row ->> 'invoice_number') || ')';
+      END IF;
+      RETURN v;
+
+    WHEN 'clients' THEN
+      RETURN nullif(trim(p_row ->> 'name'), '');
+
+    WHEN 'projects' THEN
+      v := nullif(trim(p_row ->> 'code'), '');
+      v_desc := nullif(trim(p_row ->> 'description'), '');
+      IF v IS NOT NULL AND v_desc IS NOT NULL THEN
+        RETURN v || ' — ' || v_desc;
+      END IF;
+      RETURN coalesce(v, v_desc);
+
+    WHEN 'vehicles' THEN
+      RETURN coalesce(
+        nullif(trim(p_row ->> 'registration'), ''),
+        nullif(trim(p_row ->> 'description'), '')
+      );
+
+    WHEN 'plant' THEN
+      v := nullif(trim(p_row ->> 'description'), '');
+      v_desc := nullif(trim(p_row ->> 'serial_no'), '');
+      IF v IS NOT NULL AND v_desc IS NOT NULL THEN
+        RETURN v || ' (' || v_desc || ')';
+      END IF;
+      RETURN coalesce(v, v_desc);
+
+    WHEN 'subcontractors', 'havs_tools' THEN
+      RETURN nullif(trim(p_row ->> 'name'), '');
+
+    WHEN 'profiles' THEN
+      v := nullif(trim(p_row ->> 'full_name'), '');
+      IF v IS NOT NULL AND nullif(trim(p_row ->> 'username'), '') IS NOT NULL THEN
+        RETURN v || ' (@' || trim(p_row ->> 'username') || ')';
+      END IF;
+      IF v IS NOT NULL THEN
+        RETURN v;
+      END IF;
+      IF nullif(trim(p_row ->> 'username'), '') IS NOT NULL THEN
+        RETURN '@' || trim(p_row ->> 'username');
+      END IF;
+      RETURN NULL;
+
+    WHEN 'holidays' THEN
+      IF coalesce(p_row ->> 'start_date', '') <> '' AND coalesce(p_row ->> 'end_date', '') <> '' THEN
+        RETURN trim(p_row ->> 'start_date') || ' to ' || trim(p_row ->> 'end_date');
+      END IF;
+      RETURN NULL;
+
+    ELSE
+      RETURN NULL;
+  END CASE;
+END;
+$$;
+
+
+ALTER FUNCTION "public"."audit_entity_label"("p_table" "text", "p_row" "jsonb") OWNER TO "postgres";
+
+
+CREATE OR REPLACE FUNCTION "public"."audit_finalize_submission_summary"("p_table" "text", "p_action" "text", "p_base_summary" "text", "p_row" "jsonb", "p_actor_id" "uuid") RETURNS "text"
+    LANGUAGE "plpgsql" STABLE
+    AS $$
+DECLARE
+  v_subject_id uuid;
+  v_subject_name text;
+  v_detail text;
+  v_form_label text;
+  v_verb text;
+  v_summary text;
+BEGIN
+  IF NOT public.audit_is_submission_parent(p_table) THEN
+    RETURN p_base_summary;
+  END IF;
+
+  v_form_label := lower(public.audit_submission_form_label(p_table));
+  v_subject_id := public.audit_submission_subject_id(p_table, p_row);
+  v_subject_name := CASE WHEN v_subject_id IS NOT NULL THEN public.audit_profile_display_name(v_subject_id) ELSE NULL END;
+  v_detail := public.audit_submission_detail(p_table, p_row);
+
+  IF p_action = 'insert' THEN
+    v_verb := 'Submitted';
+  ELSIF p_action = 'delete' THEN
+    v_verb := 'Deleted';
+  ELSIF p_base_summary ILIKE 'Approved %' OR p_base_summary ILIKE 'Rejected %'
+     OR p_base_summary ILIKE 'Submitted %' OR p_base_summary ILIKE 'Resubmitted %' THEN
+    v_verb := split_part(p_base_summary, ' ', 1);
+    v_summary := p_base_summary;
+  ELSE
+    v_verb := 'Updated';
+  END IF;
+
+  IF v_summary IS NULL THEN
+    v_summary := v_verb || ' ' || v_form_label;
+  END IF;
+
+  IF v_subject_id IS NOT NULL AND p_actor_id IS NOT NULL AND v_subject_id <> p_actor_id THEN
+    v_summary := v_summary || ' on behalf of ' || v_subject_name;
+  ELSIF v_subject_id IS NOT NULL AND p_actor_id IS NOT NULL AND v_subject_id = p_actor_id
+        AND p_table IN ('rams_briefings', 'toolbox_talks', 'daily_briefings') THEN
+  ELSIF v_subject_name IS NOT NULL AND p_table = 'employee_starters' THEN
+    v_summary := v_summary || ' for ' || v_subject_name;
+  END IF;
+
+  IF v_detail IS NOT NULL THEN
+    v_summary := v_summary || ' — ' || v_detail;
+  END IF;
+
+  RETURN v_summary;
+END;
+$$;
+
+
+ALTER FUNCTION "public"."audit_finalize_submission_summary"("p_table" "text", "p_action" "text", "p_base_summary" "text", "p_row" "jsonb", "p_actor_id" "uuid") OWNER TO "postgres";
 
 
 CREATE OR REPLACE FUNCTION "public"."audit_ignored_columns"() RETURNS "text"[]
@@ -1027,6 +1293,19 @@ $$;
 
 
 ALTER FUNCTION "public"."audit_ignored_columns"() OWNER TO "postgres";
+
+
+CREATE OR REPLACE FUNCTION "public"."audit_is_submission_parent"("p_table" "text") RETURNS boolean
+    LANGUAGE "sql" IMMUTABLE
+    AS $$
+  SELECT p_table = ANY (ARRAY[
+    'timesheets', 'plant_inspections', 'vehicle_defects', 'rams_briefings',
+    'havs_logs', 'toolbox_talks', 'daily_briefings', 'employee_starters', 'holidays'
+  ]::text[]);
+$$;
+
+
+ALTER FUNCTION "public"."audit_is_submission_parent"("p_table" "text") OWNER TO "postgres";
 
 
 CREATE OR REPLACE FUNCTION "public"."audit_parent_link"("p_table" "text", "p_row" "anyelement") RETURNS TABLE("parent_type" "text", "parent_id" "uuid")
@@ -1079,6 +1358,22 @@ $_$;
 ALTER FUNCTION "public"."audit_parent_link"("p_table" "text", "p_row" "anyelement") OWNER TO "postgres";
 
 
+CREATE OR REPLACE FUNCTION "public"."audit_profile_display_name"("p_user_id" "uuid") RETURNS "text"
+    LANGUAGE "sql" STABLE
+    AS $$
+  SELECT coalesce(
+    nullif(trim(p.full_name), ''),
+    CASE WHEN nullif(trim(p.username), '') IS NOT NULL THEN '@' || trim(p.username) ELSE NULL END,
+    left(p_user_id::text, 8)
+  )
+  FROM public.profiles p
+  WHERE p.id = p_user_id;
+$$;
+
+
+ALTER FUNCTION "public"."audit_profile_display_name"("p_user_id" "uuid") OWNER TO "postgres";
+
+
 CREATE OR REPLACE FUNCTION "public"."audit_redact_value"("p_key" "text", "p_value" "jsonb") RETURNS "jsonb"
     LANGUAGE "sql" IMMUTABLE
     AS $$
@@ -1104,6 +1399,9 @@ DECLARE
   v_parent_type text;
   v_parent_id uuid;
   v_link record;
+  v_row jsonb;
+  v_metadata jsonb;
+  v_actor uuid;
 BEGIN
   IF coalesce(current_setting('audit.suppress_row_trigger', true), '') = 'on' THEN
     RETURN COALESCE(NEW, OLD);
@@ -1113,18 +1411,29 @@ BEGIN
     RETURN COALESCE(NEW, OLD);
   END IF;
 
+  v_actor := auth.uid();
+  v_metadata := NULL;
+
   IF TG_OP = 'INSERT' THEN
     v_action := 'insert';
     v_entity_id := NEW.id;
     v_changes := public.audit_row_to_jsonb(TG_TABLE_NAME, NEW);
     v_summary := public.audit_build_summary(TG_TABLE_NAME, v_action, NEW, NULL, v_changes);
+    v_row := to_jsonb(NEW);
+    IF public.audit_is_submission_parent(TG_TABLE_NAME) THEN
+      v_summary := public.audit_finalize_submission_summary(TG_TABLE_NAME, v_action, v_summary, v_row, v_actor);
+      v_metadata := public.audit_submission_metadata(TG_TABLE_NAME, v_row, v_actor);
+    END IF;
+    SELECT e.out_summary, e.out_metadata
+    INTO v_summary, v_metadata
+    FROM public.audit_enrich_with_entity_label(TG_TABLE_NAME, v_summary, v_metadata, v_row) e;
     SELECT * INTO v_link FROM public.audit_parent_link(TG_TABLE_NAME, NEW);
     v_parent_type := v_link.parent_type;
     v_parent_id := v_link.parent_id;
     INSERT INTO public.audit_log (
-      actor_id, action, entity_type, entity_id, parent_type, parent_id, summary, changes
+      actor_id, action, entity_type, entity_id, parent_type, parent_id, summary, changes, metadata
     ) VALUES (
-      auth.uid(), v_action, TG_TABLE_NAME, v_entity_id, v_parent_type, v_parent_id, v_summary, v_changes
+      v_actor, v_action, TG_TABLE_NAME, v_entity_id, v_parent_type, v_parent_id, v_summary, v_changes, v_metadata
     );
     RETURN NEW;
   ELSIF TG_OP = 'DELETE' THEN
@@ -1132,13 +1441,21 @@ BEGIN
     v_entity_id := OLD.id;
     v_changes := public.audit_row_to_jsonb(TG_TABLE_NAME, OLD);
     v_summary := public.audit_build_summary(TG_TABLE_NAME, v_action, NULL, OLD, v_changes);
+    v_row := to_jsonb(OLD);
+    IF public.audit_is_submission_parent(TG_TABLE_NAME) THEN
+      v_summary := public.audit_finalize_submission_summary(TG_TABLE_NAME, v_action, v_summary, v_row, v_actor);
+      v_metadata := public.audit_submission_metadata(TG_TABLE_NAME, v_row, v_actor);
+    END IF;
+    SELECT e.out_summary, e.out_metadata
+    INTO v_summary, v_metadata
+    FROM public.audit_enrich_with_entity_label(TG_TABLE_NAME, v_summary, v_metadata, v_row) e;
     SELECT * INTO v_link FROM public.audit_parent_link(TG_TABLE_NAME, OLD);
     v_parent_type := v_link.parent_type;
     v_parent_id := v_link.parent_id;
     INSERT INTO public.audit_log (
-      actor_id, action, entity_type, entity_id, parent_type, parent_id, summary, changes
+      actor_id, action, entity_type, entity_id, parent_type, parent_id, summary, changes, metadata
     ) VALUES (
-      auth.uid(), v_action, TG_TABLE_NAME, v_entity_id, v_parent_type, v_parent_id, v_summary, v_changes
+      v_actor, v_action, TG_TABLE_NAME, v_entity_id, v_parent_type, v_parent_id, v_summary, v_changes, v_metadata
     );
     RETURN OLD;
   END IF;
@@ -1150,13 +1467,21 @@ BEGIN
     RETURN NEW;
   END IF;
   v_summary := public.audit_build_summary(TG_TABLE_NAME, v_action, NEW, OLD, v_changes);
+  v_row := to_jsonb(NEW);
+  IF public.audit_is_submission_parent(TG_TABLE_NAME) THEN
+    v_summary := public.audit_finalize_submission_summary(TG_TABLE_NAME, v_action, v_summary, v_row, v_actor);
+    v_metadata := public.audit_submission_metadata(TG_TABLE_NAME, v_row, v_actor);
+  END IF;
+  SELECT e.out_summary, e.out_metadata
+  INTO v_summary, v_metadata
+  FROM public.audit_enrich_with_entity_label(TG_TABLE_NAME, v_summary, v_metadata, v_row) e;
   SELECT * INTO v_link FROM public.audit_parent_link(TG_TABLE_NAME, NEW);
   v_parent_type := v_link.parent_type;
   v_parent_id := v_link.parent_id;
   INSERT INTO public.audit_log (
-    actor_id, action, entity_type, entity_id, parent_type, parent_id, summary, changes
+    actor_id, action, entity_type, entity_id, parent_type, parent_id, summary, changes, metadata
   ) VALUES (
-    auth.uid(), v_action, TG_TABLE_NAME, v_entity_id, v_parent_type, v_parent_id, v_summary, v_changes
+    v_actor, v_action, TG_TABLE_NAME, v_entity_id, v_parent_type, v_parent_id, v_summary, v_changes, v_metadata
   );
   RETURN NEW;
 END;
@@ -1226,6 +1551,142 @@ $$;
 
 
 ALTER FUNCTION "public"."audit_row_to_jsonb"("p_table" "text", "p_row" "anyelement") OWNER TO "postgres";
+
+
+CREATE OR REPLACE FUNCTION "public"."audit_submission_detail"("p_table" "text", "p_row" "jsonb") RETURNS "text"
+    LANGUAGE "plpgsql" STABLE
+    AS $$
+DECLARE
+  v_date date;
+BEGIN
+  CASE p_table
+    WHEN 'timesheets' THEN
+      v_date := NULLIF(p_row ->> 'week_ending', '')::date;
+      IF v_date IS NOT NULL THEN
+        RETURN 'week ending ' || to_char(v_date, 'DD Mon YYYY');
+      END IF;
+    WHEN 'plant_inspections' THEN
+      v_date := NULLIF(p_row ->> 'inspection_date', '')::date;
+      IF v_date IS NOT NULL THEN
+        RETURN 'inspection ' || to_char(v_date, 'DD Mon YYYY');
+      END IF;
+    WHEN 'vehicle_defects' THEN
+      v_date := NULLIF(p_row ->> 'inspection_date', '')::date;
+      IF v_date IS NOT NULL THEN
+        RETURN 'inspection ' || to_char(v_date, 'DD Mon YYYY');
+      END IF;
+    WHEN 'havs_logs' THEN
+      v_date := NULLIF(p_row ->> 'log_date', '')::date;
+      IF v_date IS NOT NULL THEN
+        RETURN 'log ' || to_char(v_date, 'DD Mon YYYY');
+      END IF;
+    WHEN 'rams_briefings' THEN
+      v_date := NULLIF(p_row ->> 'briefing_date', '')::date;
+      IF v_date IS NOT NULL THEN
+        RETURN 'briefing ' || to_char(v_date, 'DD Mon YYYY');
+      END IF;
+    WHEN 'toolbox_talks' THEN
+      IF coalesce(nullif(trim(p_row ->> 'topic'), ''), '') <> '' THEN
+        RETURN 'topic: ' || left(trim(p_row ->> 'topic'), 80);
+      END IF;
+    WHEN 'daily_briefings' THEN
+      IF p_row ->> 'time_delivered' IS NOT NULL THEN
+        RETURN 'delivered ' || left(p_row ->> 'time_delivered', 40);
+      END IF;
+    WHEN 'holidays' THEN
+      IF p_row ->> 'start_date' IS NOT NULL AND p_row ->> 'end_date' IS NOT NULL THEN
+        RETURN to_char((p_row ->> 'start_date')::date, 'DD Mon YYYY')
+          || ' – '
+          || to_char((p_row ->> 'end_date')::date, 'DD Mon YYYY');
+      END IF;
+    WHEN 'employee_starters' THEN
+      IF coalesce(nullif(trim(p_row ->> 'full_name'), ''), '') <> '' THEN
+        RETURN trim(p_row ->> 'full_name');
+      END IF;
+    ELSE
+      NULL;
+  END CASE;
+  RETURN NULL;
+END;
+$$;
+
+
+ALTER FUNCTION "public"."audit_submission_detail"("p_table" "text", "p_row" "jsonb") OWNER TO "postgres";
+
+
+CREATE OR REPLACE FUNCTION "public"."audit_submission_form_label"("p_table" "text") RETURNS "text"
+    LANGUAGE "sql" IMMUTABLE
+    AS $$
+  SELECT CASE p_table
+    WHEN 'timesheets' THEN 'Timesheet'
+    WHEN 'plant_inspections' THEN 'Plant inspection'
+    WHEN 'vehicle_defects' THEN 'Vehicle defect'
+    WHEN 'rams_briefings' THEN 'RAMS briefing'
+    WHEN 'havs_logs' THEN 'HAVS log'
+    WHEN 'toolbox_talks' THEN 'Toolbox talk'
+    WHEN 'daily_briefings' THEN 'Daily briefing'
+    WHEN 'employee_starters' THEN 'Starter form'
+    WHEN 'holidays' THEN 'Holiday request'
+    ELSE NULL
+  END;
+$$;
+
+
+ALTER FUNCTION "public"."audit_submission_form_label"("p_table" "text") OWNER TO "postgres";
+
+
+CREATE OR REPLACE FUNCTION "public"."audit_submission_metadata"("p_table" "text", "p_row" "jsonb", "p_actor_id" "uuid") RETURNS "jsonb"
+    LANGUAGE "plpgsql" STABLE
+    AS $$
+DECLARE
+  v_subject_id uuid;
+  v_subject_name text;
+  v_detail text;
+  v_form_label text;
+BEGIN
+  IF NOT public.audit_is_submission_parent(p_table) THEN
+    RETURN NULL;
+  END IF;
+
+  v_subject_id := public.audit_submission_subject_id(p_table, p_row);
+  v_subject_name := CASE WHEN v_subject_id IS NOT NULL THEN public.audit_profile_display_name(v_subject_id) ELSE NULL END;
+  v_detail := public.audit_submission_detail(p_table, p_row);
+  v_form_label := public.audit_submission_form_label(p_table);
+
+  RETURN jsonb_strip_nulls(jsonb_build_object(
+    'form_kind', p_table,
+    'form_label', v_form_label,
+    'subject_user_id', v_subject_id,
+    'subject_name', v_subject_name,
+    'on_behalf', CASE
+      WHEN v_subject_id IS NOT NULL AND p_actor_id IS NOT NULL AND v_subject_id <> p_actor_id THEN true
+      ELSE false
+    END,
+    'detail', v_detail
+  ));
+END;
+$$;
+
+
+ALTER FUNCTION "public"."audit_submission_metadata"("p_table" "text", "p_row" "jsonb", "p_actor_id" "uuid") OWNER TO "postgres";
+
+
+CREATE OR REPLACE FUNCTION "public"."audit_submission_subject_id"("p_table" "text", "p_row" "jsonb") RETURNS "uuid"
+    LANGUAGE "sql" IMMUTABLE
+    AS $$
+  SELECT CASE
+    WHEN p_table IN ('timesheets', 'plant_inspections', 'vehicle_defects', 'havs_logs') THEN
+      NULLIF(p_row ->> 'worker_id', '')::uuid
+    WHEN p_table IN ('holidays', 'employee_starters') THEN
+      NULLIF(p_row ->> 'user_id', '')::uuid
+    WHEN p_table IN ('rams_briefings', 'toolbox_talks', 'daily_briefings') THEN
+      NULLIF(p_row ->> 'briefer_id', '')::uuid
+    ELSE NULL
+  END;
+$$;
+
+
+ALTER FUNCTION "public"."audit_submission_subject_id"("p_table" "text", "p_row" "jsonb") OWNER TO "postgres";
 
 
 CREATE OR REPLACE FUNCTION "public"."auto_assign_todo_list_creator"() RETURNS "trigger"
@@ -3522,7 +3983,7 @@ $$;
 ALTER FUNCTION "public"."is_staff_relay_domain"("p_domain" "text") OWNER TO "postgres";
 
 
-CREATE OR REPLACE FUNCTION "public"."list_audit_log"("p_from" timestamp with time zone DEFAULT NULL::timestamp with time zone, "p_to" timestamp with time zone DEFAULT NULL::timestamp with time zone, "p_actor_id" "uuid" DEFAULT NULL::"uuid", "p_entity_type" "text" DEFAULT ''::"text", "p_action" "text" DEFAULT ''::"text", "p_search" "text" DEFAULT ''::"text", "p_limit" integer DEFAULT 50, "p_offset" integer DEFAULT 0) RETURNS TABLE("id" "uuid", "created_at" timestamp with time zone, "actor_id" "uuid", "actor_username" "text", "actor_full_name" "text", "action" "text", "entity_type" "text", "entity_id" "uuid", "parent_type" "text", "parent_id" "uuid", "summary" "text", "changes" "jsonb", "metadata" "jsonb", "total_count" bigint)
+CREATE OR REPLACE FUNCTION "public"."list_audit_log"("p_from" timestamp with time zone DEFAULT NULL::timestamp with time zone, "p_to" timestamp with time zone DEFAULT NULL::timestamp with time zone, "p_actor_id" "uuid" DEFAULT NULL::"uuid", "p_entity_type" "text" DEFAULT ''::"text", "p_action" "text" DEFAULT ''::"text", "p_search" "text" DEFAULT ''::"text", "p_limit" integer DEFAULT 50, "p_offset" integer DEFAULT 0) RETURNS TABLE("id" "uuid", "created_at" timestamp with time zone, "actor_id" "uuid", "actor_username" "text", "actor_full_name" "text", "action" "text", "entity_type" "text", "entity_id" "uuid", "parent_type" "text", "parent_id" "uuid", "summary" "text", "changes" "jsonb", "metadata" "jsonb", "form_label" "text", "subject_full_name" "text", "subject_username" "text", "on_behalf" boolean, "total_count" bigint)
     LANGUAGE "sql" STABLE SECURITY DEFINER
     SET "search_path" TO 'public'
     AS $$
@@ -3530,9 +3991,31 @@ CREATE OR REPLACE FUNCTION "public"."list_audit_log"("p_from" timestamp with tim
     SELECT
       a.*,
       p.username AS actor_username,
-      p.full_name AS actor_full_name
+      p.full_name AS actor_full_name,
+      coalesce(
+        a.metadata ->> 'form_label',
+        public.audit_submission_form_label(a.entity_type),
+        CASE a.entity_type
+          WHEN 'cost_invoices' THEN 'Cost invoice'
+          WHEN 'invoices' THEN 'Outgoing invoice'
+          WHEN 'profiles' THEN 'User'
+          WHEN 'user_roles' THEN 'User role'
+          WHEN 'employee_pay' THEN 'Shift rate'
+          WHEN 'clients' THEN 'Client'
+          WHEN 'projects' THEN 'Project'
+          WHEN 'vehicles' THEN 'Vehicle'
+          WHEN 'plant' THEN 'Plant'
+          WHEN 'subcontractors' THEN 'Subcontractor'
+          WHEN 'havs_tools' THEN 'HAVS tool'
+          ELSE a.entity_type
+        END
+      ) AS form_label,
+      sp.full_name AS subject_full_name,
+      sp.username AS subject_username,
+      coalesce((a.metadata ->> 'on_behalf')::boolean, false) AS on_behalf
     FROM public.audit_log a
     LEFT JOIN public.profiles p ON p.id = a.actor_id
+    LEFT JOIN public.profiles sp ON sp.id = NULLIF(a.metadata ->> 'subject_user_id', '')::uuid
     WHERE public.has_permission(auth.uid(), 'admin.audit_log', false)
       AND (p_from IS NULL OR a.created_at >= p_from)
       AND (p_to IS NULL OR a.created_at <= p_to)
@@ -3550,6 +4033,13 @@ CREATE OR REPLACE FUNCTION "public"."list_audit_log"("p_from" timestamp with tim
         OR a.summary ILIKE '%' || trim(p_search) || '%'
         OR p.username ILIKE '%' || trim(p_search) || '%'
         OR p.full_name ILIKE '%' || trim(p_search) || '%'
+        OR sp.username ILIKE '%' || trim(p_search) || '%'
+        OR sp.full_name ILIKE '%' || trim(p_search) || '%'
+        OR coalesce(a.metadata ->> 'subject_name', '') ILIKE '%' || trim(p_search) || '%'
+        OR coalesce(a.metadata ->> 'detail', '') ILIKE '%' || trim(p_search) || '%'
+        OR coalesce(a.metadata ->> 'form_label', '') ILIKE '%' || trim(p_search) || '%'
+        OR coalesce(a.metadata ->> 'entity_label', '') ILIKE '%' || trim(p_search) || '%'
+        OR coalesce(a.metadata -> 'invoices'::text, '[]'::jsonb)::text ILIKE '%' || trim(p_search) || '%'
       )
   ),
   counted AS (
@@ -3569,6 +4059,10 @@ CREATE OR REPLACE FUNCTION "public"."list_audit_log"("p_from" timestamp with tim
     f.summary,
     f.changes,
     f.metadata,
+    f.form_label,
+    f.subject_full_name,
+    f.subject_username,
+    f.on_behalf,
     c.cnt AS total_count
   FROM filtered f
   CROSS JOIN counted c
@@ -4989,6 +5483,60 @@ $$;
 ALTER FUNCTION "public"."lookup_cost_supplier_by_identifiers"("p_vat" "text", "p_company_reg" "text", "p_name" "text") OWNER TO "postgres";
 
 
+CREATE OR REPLACE FUNCTION "public"."mark_cost_invoices_paid_by_ids"("p_ids" "uuid"[], "p_paid" boolean DEFAULT true) RETURNS TABLE("updated_count" bigint)
+    LANGUAGE "plpgsql" SECURITY DEFINER
+    SET "search_path" TO 'public'
+    AS $$
+DECLARE
+  v_now timestamptz := now();
+  v_actor uuid := auth.uid();
+  v_ids uuid[];
+  v_count bigint;
+BEGIN
+  PERFORM public.assert_rpc_admin();
+  PERFORM set_config('audit.suppress_row_trigger', 'on', true);
+
+  IF p_ids IS NULL OR array_length(p_ids, 1) IS NULL THEN
+    RETURN QUERY SELECT 0::bigint;
+    RETURN;
+  END IF;
+
+  WITH upd AS (
+    UPDATE public.cost_invoices ci
+    SET
+      paid_at = CASE WHEN p_paid THEN v_now ELSE NULL END,
+      payment_reminded_at = CASE WHEN p_paid THEN NULL ELSE ci.payment_reminded_at END,
+      payment_reminder_month = CASE WHEN p_paid THEN NULL ELSE ci.payment_reminder_month END,
+      payment_reminder_dismissed_at = CASE WHEN p_paid THEN NULL ELSE ci.payment_reminder_dismissed_at END
+    WHERE ci.id = ANY (p_ids)
+    RETURNING ci.id
+  )
+  SELECT array_agg(id), count(*)::bigint INTO v_ids, v_count FROM upd;
+
+  IF v_count > 0 AND v_actor IS NOT NULL THEN
+    INSERT INTO public.audit_log (actor_id, action, entity_type, summary, changes, metadata)
+    VALUES (
+      v_actor,
+      'update',
+      'cost_invoices',
+      public.audit_bulk_cost_invoices_summary(v_ids, p_paid, 'marked_paid'),
+      jsonb_build_object('invoice_ids', to_jsonb(v_ids)),
+      jsonb_build_object(
+        'bulk_action', CASE WHEN p_paid THEN 'mark_paid' ELSE 'mark_unpaid' END,
+        'count', v_count,
+        'invoices', public.audit_cost_invoice_labels_json(v_ids)
+      )
+    );
+  END IF;
+
+  RETURN QUERY SELECT coalesce(v_count, 0);
+END;
+$$;
+
+
+ALTER FUNCTION "public"."mark_cost_invoices_paid_by_ids"("p_ids" "uuid"[], "p_paid" boolean) OWNER TO "postgres";
+
+
 CREATE OR REPLACE FUNCTION "public"."mark_cost_invoices_paid_filtered"("p_f_text" "text" DEFAULT ''::"text", "p_f_description" "text" DEFAULT ''::"text", "p_f_treatment" "text" DEFAULT ''::"text", "p_f_status" "text" DEFAULT ''::"text", "p_f_doc_type" "text" DEFAULT ''::"text", "p_f_company" "text" DEFAULT ''::"text", "p_f_from" "date" DEFAULT NULL::"date", "p_f_to" "date" DEFAULT NULL::"date", "p_f_po" "text" DEFAULT ''::"text", "p_f_due_from" "date" DEFAULT NULL::"date", "p_f_due_to" "date" DEFAULT NULL::"date", "p_f_paid" "text" DEFAULT 'unpaid'::"text", "p_f_cis" "text" DEFAULT ''::"text", "p_f_project" "text" DEFAULT ''::"text", "p_f_check" "text" DEFAULT ''::"text", "p_dup_only" boolean DEFAULT false, "p_missing_due_date" boolean DEFAULT false, "p_f_credit_card" "text" DEFAULT ''::"text", "p_amount_conflict_only" boolean DEFAULT false, "p_paid" boolean DEFAULT true, "p_selected_ids" "uuid"[] DEFAULT NULL::"uuid"[], "p_f_payment_reminded" boolean DEFAULT false, "p_payment_reminder_month" "text" DEFAULT NULL::"text", "p_overdue_only" boolean DEFAULT false) RETURNS TABLE("updated_count" bigint, "snapshot" "jsonb")
     LANGUAGE "plpgsql" SECURITY DEFINER
     SET "search_path" TO 'public'
@@ -4996,11 +5544,13 @@ CREATE OR REPLACE FUNCTION "public"."mark_cost_invoices_paid_filtered"("p_f_text
 DECLARE
   v_now timestamptz := now();
   v_actor uuid := auth.uid();
+  v_ids uuid[];
+  v_count bigint;
+  v_snapshot jsonb;
 BEGIN
   PERFORM public.assert_rpc_admin();
   PERFORM set_config('audit.suppress_row_trigger', 'on', true);
 
-  RETURN QUERY
   WITH targets AS (
     SELECT ci.id, ci.paid_at
     FROM public.cost_invoices ci
@@ -5023,35 +5573,44 @@ BEGIN
   ),
   upd AS (
     UPDATE public.cost_invoices ci
-    SET
-      paid_at = CASE WHEN p_paid THEN v_now ELSE NULL END,
-      payment_reminded_at = CASE WHEN p_paid THEN NULL ELSE ci.payment_reminded_at END,
-      payment_reminder_month = CASE WHEN p_paid THEN NULL ELSE ci.payment_reminder_month END,
-      payment_reminder_dismissed_at = CASE WHEN p_paid THEN NULL ELSE ci.payment_reminder_dismissed_at END
+    SET paid_at = CASE WHEN p_paid THEN v_now ELSE NULL END
     FROM targets t
     WHERE ci.id = t.id
-    RETURNING ci.id, t.paid_at AS old_paid_at
+    RETURNING ci.id
   ),
-  _audit AS (
-    INSERT INTO public.audit_log (actor_id, action, entity_type, entity_id, summary, changes)
-    SELECT
+  clear_reminders AS (
+    UPDATE public.cost_invoices ci
+    SET
+      payment_reminded_at = NULL,
+      payment_reminder_month = NULL,
+      payment_reminder_dismissed_at = NULL
+    FROM targets t
+    WHERE p_paid AND ci.id = t.id
+    RETURNING ci.id
+  )
+  SELECT
+    (SELECT array_agg(u.id) FROM upd u),
+    (SELECT count(*)::bigint FROM upd u),
+    (SELECT entries FROM snap)
+  INTO v_ids, v_count, v_snapshot;
+
+  IF coalesce(v_count, 0) > 0 AND v_actor IS NOT NULL THEN
+    INSERT INTO public.audit_log (actor_id, action, entity_type, summary, changes, metadata)
+    VALUES (
       v_actor,
       'update',
       'cost_invoices',
-      u.id,
-      CASE WHEN p_paid THEN 'Marked cost invoice as paid' ELSE 'Marked cost invoice as unpaid' END,
+      public.audit_bulk_cost_invoices_summary(v_ids, p_paid, 'marked_paid'),
+      jsonb_build_object('invoice_ids', to_jsonb(v_ids)),
       jsonb_build_object(
-        'paid_at',
-        jsonb_build_object(
-          'old', to_jsonb(u.old_paid_at),
-          'new', CASE WHEN p_paid THEN to_jsonb(v_now) ELSE 'null'::jsonb END
-        )
+        'bulk_action', CASE WHEN p_paid THEN 'mark_paid' ELSE 'mark_unpaid' END,
+        'count', v_count,
+        'invoices', public.audit_cost_invoice_labels_json(v_ids)
       )
-    FROM upd u
-    WHERE v_actor IS NOT NULL
-    RETURNING 1
-  )
-  SELECT (SELECT count(*)::bigint FROM upd), (SELECT entries FROM snap);
+    );
+  END IF;
+
+  RETURN QUERY SELECT coalesce(v_count, 0), coalesce(v_snapshot, '[]'::jsonb);
 END;
 $$;
 
@@ -6407,6 +6966,7 @@ CREATE OR REPLACE FUNCTION "public"."undo_cost_invoices_paid"("p_snapshot" "json
 DECLARE
   v_count bigint;
   v_actor uuid := auth.uid();
+  v_ids uuid[];
 BEGIN
   PERFORM public.assert_rpc_admin();
   PERFORM set_config('audit.suppress_row_trigger', 'on', true);
@@ -6432,30 +6992,27 @@ BEGIN
     SET paid_at = entries.paid_at
     FROM entries
     WHERE ci.id = entries.id
-    RETURNING ci.id, entries.old_paid_at, entries.paid_at AS new_paid_at
-  ),
-  audit_rows AS (
-    INSERT INTO public.audit_log (actor_id, action, entity_type, entity_id, summary, changes)
-    SELECT
+    RETURNING ci.id
+  )
+  SELECT array_agg(id), count(*)::bigint INTO v_ids, v_count FROM upd;
+
+  IF coalesce(v_count, 0) > 0 AND v_actor IS NOT NULL THEN
+    INSERT INTO public.audit_log (actor_id, action, entity_type, summary, changes, metadata)
+    VALUES (
       v_actor,
       'update',
       'cost_invoices',
-      u.id,
-      CASE
-        WHEN u.new_paid_at IS NULL THEN 'Marked cost invoice as unpaid'
-        ELSE 'Restored cost invoice paid date'
-      END,
+      public.audit_bulk_cost_invoices_summary(v_ids, true, 'restored_paid'),
+      jsonb_build_object('invoice_ids', to_jsonb(v_ids)),
       jsonb_build_object(
-        'paid_at',
-        jsonb_build_object('old', to_jsonb(u.old_paid_at), 'new', to_jsonb(u.new_paid_at))
+        'bulk_action', 'undo_mark_paid',
+        'count', v_count,
+        'invoices', public.audit_cost_invoice_labels_json(v_ids)
       )
-    FROM upd u
-    WHERE v_actor IS NOT NULL
-    RETURNING 1
-  )
-  SELECT count(*)::bigint INTO v_count FROM upd;
+    );
+  END IF;
 
-  RETURN v_count;
+  RETURN coalesce(v_count, 0);
 END;
 $$;
 
@@ -8592,19 +9149,7 @@ CREATE OR REPLACE TRIGGER "audit_log_trg" AFTER INSERT OR DELETE OR UPDATE ON "p
 
 
 
-CREATE OR REPLACE TRIGGER "audit_log_trg" AFTER INSERT OR DELETE OR UPDATE ON "public"."cost_invoice_splits" FOR EACH ROW EXECUTE FUNCTION "public"."audit_row_change"();
-
-
-
 CREATE OR REPLACE TRIGGER "audit_log_trg" AFTER INSERT OR DELETE OR UPDATE ON "public"."cost_invoices" FOR EACH ROW EXECUTE FUNCTION "public"."audit_row_change"();
-
-
-
-CREATE OR REPLACE TRIGGER "audit_log_trg" AFTER INSERT OR DELETE OR UPDATE ON "public"."daily_briefing_attendees" FOR EACH ROW EXECUTE FUNCTION "public"."audit_row_change"();
-
-
-
-CREATE OR REPLACE TRIGGER "audit_log_trg" AFTER INSERT OR DELETE OR UPDATE ON "public"."daily_briefing_hazards" FOR EACH ROW EXECUTE FUNCTION "public"."audit_row_change"();
 
 
 
@@ -8613,10 +9158,6 @@ CREATE OR REPLACE TRIGGER "audit_log_trg" AFTER INSERT OR DELETE OR UPDATE ON "p
 
 
 CREATE OR REPLACE TRIGGER "audit_log_trg" AFTER INSERT OR DELETE OR UPDATE ON "public"."employee_starters" FOR EACH ROW EXECUTE FUNCTION "public"."audit_row_change"();
-
-
-
-CREATE OR REPLACE TRIGGER "audit_log_trg" AFTER INSERT OR DELETE OR UPDATE ON "public"."havs_log_items" FOR EACH ROW EXECUTE FUNCTION "public"."audit_row_change"();
 
 
 
@@ -8632,19 +9173,11 @@ CREATE OR REPLACE TRIGGER "audit_log_trg" AFTER INSERT OR DELETE OR UPDATE ON "p
 
 
 
-CREATE OR REPLACE TRIGGER "audit_log_trg" AFTER INSERT OR DELETE OR UPDATE ON "public"."invoice_lines" FOR EACH ROW EXECUTE FUNCTION "public"."audit_row_change"();
-
-
-
 CREATE OR REPLACE TRIGGER "audit_log_trg" AFTER INSERT OR DELETE OR UPDATE ON "public"."invoices" FOR EACH ROW EXECUTE FUNCTION "public"."audit_row_change"();
 
 
 
 CREATE OR REPLACE TRIGGER "audit_log_trg" AFTER INSERT OR DELETE OR UPDATE ON "public"."plant" FOR EACH ROW EXECUTE FUNCTION "public"."audit_row_change"();
-
-
-
-CREATE OR REPLACE TRIGGER "audit_log_trg" AFTER INSERT OR DELETE OR UPDATE ON "public"."plant_inspection_items" FOR EACH ROW EXECUTE FUNCTION "public"."audit_row_change"();
 
 
 
@@ -8656,10 +9189,6 @@ CREATE OR REPLACE TRIGGER "audit_log_trg" AFTER INSERT OR DELETE OR UPDATE ON "p
 
 
 
-CREATE OR REPLACE TRIGGER "audit_log_trg" AFTER INSERT OR DELETE OR UPDATE ON "public"."rams_attendees" FOR EACH ROW EXECUTE FUNCTION "public"."audit_row_change"();
-
-
-
 CREATE OR REPLACE TRIGGER "audit_log_trg" AFTER INSERT OR DELETE OR UPDATE ON "public"."rams_briefings" FOR EACH ROW EXECUTE FUNCTION "public"."audit_row_change"();
 
 
@@ -8668,23 +9197,11 @@ CREATE OR REPLACE TRIGGER "audit_log_trg" AFTER INSERT OR DELETE OR UPDATE ON "p
 
 
 
-CREATE OR REPLACE TRIGGER "audit_log_trg" AFTER INSERT OR DELETE OR UPDATE ON "public"."timesheet_days" FOR EACH ROW EXECUTE FUNCTION "public"."audit_row_change"();
-
-
-
 CREATE OR REPLACE TRIGGER "audit_log_trg" AFTER INSERT OR DELETE OR UPDATE ON "public"."timesheets" FOR EACH ROW EXECUTE FUNCTION "public"."audit_row_change"();
 
 
 
-CREATE OR REPLACE TRIGGER "audit_log_trg" AFTER INSERT OR DELETE OR UPDATE ON "public"."toolbox_attendees" FOR EACH ROW EXECUTE FUNCTION "public"."audit_row_change"();
-
-
-
 CREATE OR REPLACE TRIGGER "audit_log_trg" AFTER INSERT OR DELETE OR UPDATE ON "public"."toolbox_talks" FOR EACH ROW EXECUTE FUNCTION "public"."audit_row_change"();
-
-
-
-CREATE OR REPLACE TRIGGER "audit_log_trg" AFTER INSERT OR DELETE OR UPDATE ON "public"."vehicle_defect_items" FOR EACH ROW EXECUTE FUNCTION "public"."audit_row_change"();
 
 
 
@@ -10729,15 +11246,63 @@ GRANT ALL ON FUNCTION "public"."audit_build_summary"("p_table" "text", "p_action
 
 
 
+GRANT ALL ON FUNCTION "public"."audit_bulk_cost_invoices_summary"("p_ids" "uuid"[], "p_paid" boolean, "p_mode" "text") TO "anon";
+GRANT ALL ON FUNCTION "public"."audit_bulk_cost_invoices_summary"("p_ids" "uuid"[], "p_paid" boolean, "p_mode" "text") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."audit_bulk_cost_invoices_summary"("p_ids" "uuid"[], "p_paid" boolean, "p_mode" "text") TO "service_role";
+
+
+
+GRANT ALL ON FUNCTION "public"."audit_cost_invoice_label"("p_company_name" "text", "p_invoice_number" "text") TO "anon";
+GRANT ALL ON FUNCTION "public"."audit_cost_invoice_label"("p_company_name" "text", "p_invoice_number" "text") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."audit_cost_invoice_label"("p_company_name" "text", "p_invoice_number" "text") TO "service_role";
+
+
+
+GRANT ALL ON FUNCTION "public"."audit_cost_invoice_labels_json"("p_ids" "uuid"[]) TO "anon";
+GRANT ALL ON FUNCTION "public"."audit_cost_invoice_labels_json"("p_ids" "uuid"[]) TO "authenticated";
+GRANT ALL ON FUNCTION "public"."audit_cost_invoice_labels_json"("p_ids" "uuid"[]) TO "service_role";
+
+
+
+GRANT ALL ON FUNCTION "public"."audit_enrich_with_entity_label"("p_table" "text", "p_summary" "text", "p_metadata" "jsonb", "p_row" "jsonb") TO "anon";
+GRANT ALL ON FUNCTION "public"."audit_enrich_with_entity_label"("p_table" "text", "p_summary" "text", "p_metadata" "jsonb", "p_row" "jsonb") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."audit_enrich_with_entity_label"("p_table" "text", "p_summary" "text", "p_metadata" "jsonb", "p_row" "jsonb") TO "service_role";
+
+
+
+GRANT ALL ON FUNCTION "public"."audit_entity_label"("p_table" "text", "p_row" "jsonb") TO "anon";
+GRANT ALL ON FUNCTION "public"."audit_entity_label"("p_table" "text", "p_row" "jsonb") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."audit_entity_label"("p_table" "text", "p_row" "jsonb") TO "service_role";
+
+
+
+GRANT ALL ON FUNCTION "public"."audit_finalize_submission_summary"("p_table" "text", "p_action" "text", "p_base_summary" "text", "p_row" "jsonb", "p_actor_id" "uuid") TO "anon";
+GRANT ALL ON FUNCTION "public"."audit_finalize_submission_summary"("p_table" "text", "p_action" "text", "p_base_summary" "text", "p_row" "jsonb", "p_actor_id" "uuid") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."audit_finalize_submission_summary"("p_table" "text", "p_action" "text", "p_base_summary" "text", "p_row" "jsonb", "p_actor_id" "uuid") TO "service_role";
+
+
+
 GRANT ALL ON FUNCTION "public"."audit_ignored_columns"() TO "anon";
 GRANT ALL ON FUNCTION "public"."audit_ignored_columns"() TO "authenticated";
 GRANT ALL ON FUNCTION "public"."audit_ignored_columns"() TO "service_role";
 
 
 
+GRANT ALL ON FUNCTION "public"."audit_is_submission_parent"("p_table" "text") TO "anon";
+GRANT ALL ON FUNCTION "public"."audit_is_submission_parent"("p_table" "text") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."audit_is_submission_parent"("p_table" "text") TO "service_role";
+
+
+
 GRANT ALL ON FUNCTION "public"."audit_parent_link"("p_table" "text", "p_row" "anyelement") TO "anon";
 GRANT ALL ON FUNCTION "public"."audit_parent_link"("p_table" "text", "p_row" "anyelement") TO "authenticated";
 GRANT ALL ON FUNCTION "public"."audit_parent_link"("p_table" "text", "p_row" "anyelement") TO "service_role";
+
+
+
+GRANT ALL ON FUNCTION "public"."audit_profile_display_name"("p_user_id" "uuid") TO "anon";
+GRANT ALL ON FUNCTION "public"."audit_profile_display_name"("p_user_id" "uuid") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."audit_profile_display_name"("p_user_id" "uuid") TO "service_role";
 
 
 
@@ -10762,6 +11327,30 @@ GRANT ALL ON FUNCTION "public"."audit_row_diff"("p_table" "text", "p_old" "anyel
 GRANT ALL ON FUNCTION "public"."audit_row_to_jsonb"("p_table" "text", "p_row" "anyelement") TO "anon";
 GRANT ALL ON FUNCTION "public"."audit_row_to_jsonb"("p_table" "text", "p_row" "anyelement") TO "authenticated";
 GRANT ALL ON FUNCTION "public"."audit_row_to_jsonb"("p_table" "text", "p_row" "anyelement") TO "service_role";
+
+
+
+GRANT ALL ON FUNCTION "public"."audit_submission_detail"("p_table" "text", "p_row" "jsonb") TO "anon";
+GRANT ALL ON FUNCTION "public"."audit_submission_detail"("p_table" "text", "p_row" "jsonb") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."audit_submission_detail"("p_table" "text", "p_row" "jsonb") TO "service_role";
+
+
+
+GRANT ALL ON FUNCTION "public"."audit_submission_form_label"("p_table" "text") TO "anon";
+GRANT ALL ON FUNCTION "public"."audit_submission_form_label"("p_table" "text") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."audit_submission_form_label"("p_table" "text") TO "service_role";
+
+
+
+GRANT ALL ON FUNCTION "public"."audit_submission_metadata"("p_table" "text", "p_row" "jsonb", "p_actor_id" "uuid") TO "anon";
+GRANT ALL ON FUNCTION "public"."audit_submission_metadata"("p_table" "text", "p_row" "jsonb", "p_actor_id" "uuid") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."audit_submission_metadata"("p_table" "text", "p_row" "jsonb", "p_actor_id" "uuid") TO "service_role";
+
+
+
+GRANT ALL ON FUNCTION "public"."audit_submission_subject_id"("p_table" "text", "p_row" "jsonb") TO "anon";
+GRANT ALL ON FUNCTION "public"."audit_submission_subject_id"("p_table" "text", "p_row" "jsonb") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."audit_submission_subject_id"("p_table" "text", "p_row" "jsonb") TO "service_role";
 
 
 
@@ -11313,6 +11902,13 @@ GRANT ALL ON FUNCTION "public"."list_submissions_browser"("p_from" "date", "p_to
 REVOKE ALL ON FUNCTION "public"."lookup_cost_supplier_by_identifiers"("p_vat" "text", "p_company_reg" "text", "p_name" "text") FROM PUBLIC;
 GRANT ALL ON FUNCTION "public"."lookup_cost_supplier_by_identifiers"("p_vat" "text", "p_company_reg" "text", "p_name" "text") TO "authenticated";
 GRANT ALL ON FUNCTION "public"."lookup_cost_supplier_by_identifiers"("p_vat" "text", "p_company_reg" "text", "p_name" "text") TO "service_role";
+
+
+
+REVOKE ALL ON FUNCTION "public"."mark_cost_invoices_paid_by_ids"("p_ids" "uuid"[], "p_paid" boolean) FROM PUBLIC;
+GRANT ALL ON FUNCTION "public"."mark_cost_invoices_paid_by_ids"("p_ids" "uuid"[], "p_paid" boolean) TO "anon";
+GRANT ALL ON FUNCTION "public"."mark_cost_invoices_paid_by_ids"("p_ids" "uuid"[], "p_paid" boolean) TO "authenticated";
+GRANT ALL ON FUNCTION "public"."mark_cost_invoices_paid_by_ids"("p_ids" "uuid"[], "p_paid" boolean) TO "service_role";
 
 
 
