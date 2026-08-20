@@ -6714,14 +6714,17 @@ DECLARE
   v_rate numeric(10,2);
   v_actor uuid;
 BEGIN
-  IF TG_OP = 'INSERT' THEN
-    v_actor := auth.uid();
+  v_actor := auth.uid();
 
+  IF TG_OP = 'INSERT' THEN
     -- Admin's own timesheet always auto-approves.
     IF public.has_role(NEW.worker_id, 'admin') THEN
       NEW.status := 'approved';
       NEW.approved_at := COALESCE(NEW.approved_at, now());
       NEW.approved_by := COALESCE(NEW.approved_by, NEW.worker_id);
+      NEW.change_requested_at := NULL;
+      NEW.change_requested_by := NULL;
+      NEW.rejection_reason := NULL;
 
     -- Submitted by someone else on the worker's behalf:
     ELSIF v_actor IS NOT NULL AND v_actor <> NEW.worker_id
@@ -6738,6 +6741,51 @@ BEGIN
       NEW.status := 'approved';
       NEW.approved_at := COALESCE(NEW.approved_at, now());
       NEW.approved_by := COALESCE(NEW.approved_by, v_actor);
+      NEW.change_requested_at := NULL;
+      NEW.change_requested_by := NULL;
+      NEW.rejection_reason := NULL;
+    END IF;
+  ELSIF TG_OP = 'UPDATE' THEN
+    -- Admin editing their own approved timesheet (including after a change request).
+    IF NEW.worker_id = v_actor AND public.has_role(NEW.worker_id, 'admin') THEN
+      IF OLD.status = 'approved'::submission_status OR OLD.change_requested_at IS NOT NULL THEN
+        NEW.status := 'approved';
+        NEW.approved_at := now();
+        NEW.approved_by := v_actor;
+        NEW.change_requested_at := NULL;
+        NEW.change_requested_by := NULL;
+        NEW.rejection_reason := NULL;
+      END IF;
+
+    -- Permitted on-behalf resubmit → auto-approve and clear change request.
+    ELSIF v_actor IS NOT NULL AND v_actor <> NEW.worker_id
+      AND public.has_permission(v_actor, 'submissions.submit_timesheets_on_behalf', false)
+      AND (
+        public.has_permission(v_actor, 'data.scope_org_wide', false)
+        OR (
+          public.user_subcontractor(v_actor) IS NOT NULL
+          AND public.user_subcontractor(v_actor) = public.user_subcontractor(NEW.worker_id)
+          AND NOT public.is_staff(NEW.worker_id)
+        )
+      )
+      AND (
+        OLD.change_requested_at IS NOT NULL
+        OR OLD.status IS DISTINCT FROM NEW.status
+        OR NEW.week_ending IS DISTINCT FROM OLD.week_ending
+        OR NEW.signature_url IS DISTINCT FROM OLD.signature_url
+      )
+    THEN
+      NEW.status := 'approved';
+      NEW.approved_at := now();
+      NEW.approved_by := v_actor;
+      NEW.change_requested_at := NULL;
+      NEW.change_requested_by := NULL;
+      NEW.rejection_reason := NULL;
+
+    -- Worker resubmit after change request → pending approval, clear flags.
+    ELSIF NEW.worker_id = v_actor AND OLD.change_requested_at IS NOT NULL THEN
+      NEW.change_requested_at := NULL;
+      NEW.change_requested_by := NULL;
     END IF;
   END IF;
 
