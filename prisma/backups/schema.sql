@@ -2089,6 +2089,47 @@ $$;
 ALTER FUNCTION "public"."can_view_timesheet"("_viewer_id" "uuid", "_worker_id" "uuid") OWNER TO "postgres";
 
 
+CREATE OR REPLACE FUNCTION "public"."can_view_timesheet_pending_amendment"("_timesheet_id" "uuid") RETURNS boolean
+    LANGUAGE "sql" STABLE SECURITY DEFINER
+    SET "search_path" TO 'public'
+    AS $$
+  SELECT EXISTS (
+    SELECT 1
+    FROM public.timesheets t
+    WHERE t.id = _timesheet_id
+      AND public.can_view_timesheet(auth.uid(), t.worker_id)
+  );
+$$;
+
+
+ALTER FUNCTION "public"."can_view_timesheet_pending_amendment"("_timesheet_id" "uuid") OWNER TO "postgres";
+
+
+CREATE OR REPLACE FUNCTION "public"."can_write_timesheet_pending_amendment"("_timesheet_id" "uuid") RETURNS boolean
+    LANGUAGE "sql" STABLE SECURITY DEFINER
+    SET "search_path" TO 'public'
+    AS $$
+  SELECT EXISTS (
+    SELECT 1
+    FROM public.timesheets t
+    WHERE t.id = _timesheet_id
+      AND t.worker_id = auth.uid()
+      AND t.status = 'approved'::submission_status
+      AND (
+        t.change_requested_at IS NOT NULL
+        OR EXISTS (
+          SELECT 1
+          FROM public.timesheet_pending_amendments pa
+          WHERE pa.timesheet_id = t.id
+        )
+      )
+  );
+$$;
+
+
+ALTER FUNCTION "public"."can_write_timesheet_pending_amendment"("_timesheet_id" "uuid") OWNER TO "postgres";
+
+
 CREATE OR REPLACE FUNCTION "public"."company_match_key"("p_name" "text") RETURNS "text"
     LANGUAGE "sql" IMMUTABLE
     SET "search_path" TO 'public'
@@ -6717,7 +6758,6 @@ BEGIN
   v_actor := auth.uid();
 
   IF TG_OP = 'INSERT' THEN
-    -- Admin's own timesheet always auto-approves.
     IF public.has_role(NEW.worker_id, 'admin') THEN
       NEW.status := 'approved';
       NEW.approved_at := COALESCE(NEW.approved_at, now());
@@ -6726,7 +6766,6 @@ BEGIN
       NEW.change_requested_by := NULL;
       NEW.rejection_reason := NULL;
 
-    -- Submitted by someone else on the worker's behalf:
     ELSIF v_actor IS NOT NULL AND v_actor <> NEW.worker_id
       AND public.has_permission(v_actor, 'submissions.submit_timesheets_on_behalf', false)
       AND (
@@ -6746,7 +6785,6 @@ BEGIN
       NEW.rejection_reason := NULL;
     END IF;
   ELSIF TG_OP = 'UPDATE' THEN
-    -- Admin editing their own approved timesheet (including after a change request).
     IF NEW.worker_id = v_actor AND public.has_role(NEW.worker_id, 'admin') THEN
       IF OLD.status = 'approved'::submission_status OR OLD.change_requested_at IS NOT NULL THEN
         NEW.status := 'approved';
@@ -6757,7 +6795,6 @@ BEGIN
         NEW.rejection_reason := NULL;
       END IF;
 
-    -- Permitted on-behalf resubmit → auto-approve and clear change request.
     ELSIF v_actor IS NOT NULL AND v_actor <> NEW.worker_id
       AND public.has_permission(v_actor, 'submissions.submit_timesheets_on_behalf', false)
       AND (
@@ -6781,11 +6818,6 @@ BEGIN
       NEW.change_requested_at := NULL;
       NEW.change_requested_by := NULL;
       NEW.rejection_reason := NULL;
-
-    -- Worker resubmit after change request → pending approval, clear flags.
-    ELSIF NEW.worker_id = v_actor AND OLD.change_requested_at IS NOT NULL THEN
-      NEW.change_requested_at := NULL;
-      NEW.change_requested_by := NULL;
     END IF;
   END IF;
 
@@ -8052,6 +8084,31 @@ CREATE TABLE IF NOT EXISTS "public"."timesheet_days" (
 ALTER TABLE "public"."timesheet_days" OWNER TO "postgres";
 
 
+CREATE TABLE IF NOT EXISTS "public"."timesheet_pending_amendment_days" (
+    "id" "uuid" DEFAULT "gen_random_uuid"() NOT NULL,
+    "timesheet_id" "uuid" NOT NULL,
+    "day_of_week" smallint NOT NULL,
+    "project_id" "uuid",
+    "project_text" "text",
+    "shifts" numeric(4,2) DEFAULT 0 NOT NULL
+);
+
+
+ALTER TABLE "public"."timesheet_pending_amendment_days" OWNER TO "postgres";
+
+
+CREATE TABLE IF NOT EXISTS "public"."timesheet_pending_amendments" (
+    "timesheet_id" "uuid" NOT NULL,
+    "week_ending" "date" NOT NULL,
+    "signature_url" "text" NOT NULL,
+    "submitted_at" timestamp with time zone DEFAULT "now"() NOT NULL,
+    "submitted_by" "uuid" NOT NULL
+);
+
+
+ALTER TABLE "public"."timesheet_pending_amendments" OWNER TO "postgres";
+
+
 CREATE TABLE IF NOT EXISTS "public"."timesheets" (
     "id" "uuid" DEFAULT "gen_random_uuid"() NOT NULL,
     "worker_id" "uuid",
@@ -8686,6 +8743,16 @@ ALTER TABLE ONLY "public"."timesheet_days"
 
 
 
+ALTER TABLE ONLY "public"."timesheet_pending_amendment_days"
+    ADD CONSTRAINT "timesheet_pending_amendment_days_pkey" PRIMARY KEY ("id");
+
+
+
+ALTER TABLE ONLY "public"."timesheet_pending_amendments"
+    ADD CONSTRAINT "timesheet_pending_amendments_pkey" PRIMARY KEY ("timesheet_id");
+
+
+
 ALTER TABLE ONLY "public"."timesheets"
     ADD CONSTRAINT "timesheets_pkey" PRIMARY KEY ("id");
 
@@ -9063,6 +9130,10 @@ CREATE INDEX "submission_photos_kind_submission_id_idx" ON "public"."submission_
 
 
 CREATE INDEX "timesheet_days_timesheet_id_day_idx" ON "public"."timesheet_days" USING "btree" ("timesheet_id", "day_of_week");
+
+
+
+CREATE INDEX "timesheet_pending_amendment_days_timesheet_id_idx" ON "public"."timesheet_pending_amendment_days" USING "btree" ("timesheet_id");
 
 
 
@@ -9782,6 +9853,26 @@ ALTER TABLE ONLY "public"."timesheet_days"
 
 ALTER TABLE ONLY "public"."timesheet_days"
     ADD CONSTRAINT "timesheet_days_timesheet_id_fkey" FOREIGN KEY ("timesheet_id") REFERENCES "public"."timesheets"("id") ON DELETE CASCADE;
+
+
+
+ALTER TABLE ONLY "public"."timesheet_pending_amendment_days"
+    ADD CONSTRAINT "timesheet_pending_amendment_days_project_id_fkey" FOREIGN KEY ("project_id") REFERENCES "public"."projects"("id") ON DELETE SET NULL;
+
+
+
+ALTER TABLE ONLY "public"."timesheet_pending_amendment_days"
+    ADD CONSTRAINT "timesheet_pending_amendment_days_timesheet_id_fkey" FOREIGN KEY ("timesheet_id") REFERENCES "public"."timesheet_pending_amendments"("timesheet_id") ON DELETE CASCADE;
+
+
+
+ALTER TABLE ONLY "public"."timesheet_pending_amendments"
+    ADD CONSTRAINT "timesheet_pending_amendments_submitted_by_fkey" FOREIGN KEY ("submitted_by") REFERENCES "auth"."users"("id");
+
+
+
+ALTER TABLE ONLY "public"."timesheet_pending_amendments"
+    ADD CONSTRAINT "timesheet_pending_amendments_timesheet_id_fkey" FOREIGN KEY ("timesheet_id") REFERENCES "public"."timesheets"("id") ON DELETE CASCADE;
 
 
 
@@ -10688,6 +10779,22 @@ CREATE POLICY "tbx_att read" ON "public"."toolbox_attendees" FOR SELECT TO "auth
 
 
 
+CREATE POLICY "timesheet pending amendment days owner write" ON "public"."timesheet_pending_amendment_days" TO "authenticated" USING ("public"."can_write_timesheet_pending_amendment"("timesheet_id")) WITH CHECK ("public"."can_write_timesheet_pending_amendment"("timesheet_id"));
+
+
+
+CREATE POLICY "timesheet pending amendment days read" ON "public"."timesheet_pending_amendment_days" FOR SELECT TO "authenticated" USING ("public"."can_view_timesheet_pending_amendment"("timesheet_id"));
+
+
+
+CREATE POLICY "timesheet pending amendments owner write" ON "public"."timesheet_pending_amendments" TO "authenticated" USING ("public"."can_write_timesheet_pending_amendment"("timesheet_id")) WITH CHECK ("public"."can_write_timesheet_pending_amendment"("timesheet_id"));
+
+
+
+CREATE POLICY "timesheet pending amendments read" ON "public"."timesheet_pending_amendments" FOR SELECT TO "authenticated" USING ("public"."can_view_timesheet_pending_amendment"("timesheet_id"));
+
+
+
 ALTER TABLE "public"."timesheet_days" ENABLE ROW LEVEL SECURITY;
 
 
@@ -10703,6 +10810,12 @@ CREATE POLICY "timesheet_days read" ON "public"."timesheet_days" FOR SELECT TO "
    FROM "public"."timesheets" "t"
   WHERE (("t"."id" = "timesheet_days"."timesheet_id") AND (("t"."worker_id" = "auth"."uid"()) OR "public"."is_staff"("auth"."uid"()))))));
 
+
+
+ALTER TABLE "public"."timesheet_pending_amendment_days" ENABLE ROW LEVEL SECURITY;
+
+
+ALTER TABLE "public"."timesheet_pending_amendments" ENABLE ROW LEVEL SECURITY;
 
 
 ALTER TABLE "public"."timesheets" ENABLE ROW LEVEL SECURITY;
@@ -11521,6 +11634,18 @@ GRANT ALL ON FUNCTION "public"."can_view_starter"("_viewer_id" "uuid", "_owner_i
 REVOKE ALL ON FUNCTION "public"."can_view_timesheet"("_viewer_id" "uuid", "_worker_id" "uuid") FROM PUBLIC;
 GRANT ALL ON FUNCTION "public"."can_view_timesheet"("_viewer_id" "uuid", "_worker_id" "uuid") TO "authenticated";
 GRANT ALL ON FUNCTION "public"."can_view_timesheet"("_viewer_id" "uuid", "_worker_id" "uuid") TO "service_role";
+
+
+
+REVOKE ALL ON FUNCTION "public"."can_view_timesheet_pending_amendment"("_timesheet_id" "uuid") FROM PUBLIC;
+GRANT ALL ON FUNCTION "public"."can_view_timesheet_pending_amendment"("_timesheet_id" "uuid") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."can_view_timesheet_pending_amendment"("_timesheet_id" "uuid") TO "service_role";
+
+
+
+REVOKE ALL ON FUNCTION "public"."can_write_timesheet_pending_amendment"("_timesheet_id" "uuid") FROM PUBLIC;
+GRANT ALL ON FUNCTION "public"."can_write_timesheet_pending_amendment"("_timesheet_id" "uuid") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."can_write_timesheet_pending_amendment"("_timesheet_id" "uuid") TO "service_role";
 
 
 
@@ -12625,6 +12750,18 @@ GRANT ALL ON TABLE "public"."submission_photos" TO "service_role";
 GRANT ALL ON TABLE "public"."timesheet_days" TO "anon";
 GRANT ALL ON TABLE "public"."timesheet_days" TO "authenticated";
 GRANT ALL ON TABLE "public"."timesheet_days" TO "service_role";
+
+
+
+GRANT ALL ON TABLE "public"."timesheet_pending_amendment_days" TO "anon";
+GRANT ALL ON TABLE "public"."timesheet_pending_amendment_days" TO "authenticated";
+GRANT ALL ON TABLE "public"."timesheet_pending_amendment_days" TO "service_role";
+
+
+
+GRANT ALL ON TABLE "public"."timesheet_pending_amendments" TO "anon";
+GRANT ALL ON TABLE "public"."timesheet_pending_amendments" TO "authenticated";
+GRANT ALL ON TABLE "public"."timesheet_pending_amendments" TO "service_role";
 
 
 
