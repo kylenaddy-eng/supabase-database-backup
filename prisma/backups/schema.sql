@@ -176,7 +176,7 @@ $$;
 ALTER FUNCTION "public"."admin_set_vault_secret"("p_name" "text", "p_value" "text") OWNER TO "postgres";
 
 
-CREATE OR REPLACE FUNCTION "public"."aggregate_cost_invoice_summary"("p_f_text" "text" DEFAULT ''::"text", "p_f_description" "text" DEFAULT ''::"text", "p_f_treatment" "text" DEFAULT ''::"text", "p_f_status" "text" DEFAULT ''::"text", "p_f_doc_type" "text" DEFAULT ''::"text", "p_f_company" "text" DEFAULT ''::"text", "p_f_from" "date" DEFAULT NULL::"date", "p_f_to" "date" DEFAULT NULL::"date", "p_f_po" "text" DEFAULT ''::"text", "p_f_due_from" "date" DEFAULT NULL::"date", "p_f_due_to" "date" DEFAULT NULL::"date", "p_f_paid" "text" DEFAULT ''::"text", "p_f_cis" "text" DEFAULT ''::"text", "p_f_project" "text" DEFAULT ''::"text", "p_f_check" "text" DEFAULT ''::"text", "p_dup_only" boolean DEFAULT false, "p_missing_due_date" boolean DEFAULT false, "p_f_credit_card" "text" DEFAULT ''::"text", "p_amount_conflict_only" boolean DEFAULT false) RETURNS "jsonb"
+CREATE OR REPLACE FUNCTION "public"."aggregate_cost_invoice_summary"("p_f_text" "text" DEFAULT ''::"text", "p_f_description" "text" DEFAULT ''::"text", "p_f_treatment" "text" DEFAULT ''::"text", "p_f_status" "text" DEFAULT ''::"text", "p_f_doc_type" "text" DEFAULT ''::"text", "p_f_company" "text" DEFAULT ''::"text", "p_f_from" "date" DEFAULT NULL::"date", "p_f_to" "date" DEFAULT NULL::"date", "p_f_po" "text" DEFAULT ''::"text", "p_f_due_from" "date" DEFAULT NULL::"date", "p_f_due_to" "date" DEFAULT NULL::"date", "p_f_paid" "text" DEFAULT ''::"text", "p_f_cis" "text" DEFAULT ''::"text", "p_f_project" "text" DEFAULT ''::"text", "p_f_check" "text" DEFAULT ''::"text", "p_dup_only" boolean DEFAULT false, "p_missing_due_date" boolean DEFAULT false, "p_f_credit_card" "text" DEFAULT ''::"text", "p_amount_conflict_only" boolean DEFAULT false, "p_overdue_only" boolean DEFAULT false, "p_f_confidential" "text" DEFAULT ''::"text") RETURNS "jsonb"
     LANGUAGE "sql" STABLE SECURITY DEFINER
     SET "search_path" TO 'public'
     AS $$
@@ -189,7 +189,7 @@ CREATE OR REPLACE FUNCTION "public"."aggregate_cost_invoice_summary"("p_f_text" 
         p_f_text, p_f_description, p_f_treatment, p_f_status, p_f_doc_type, p_f_company,
         p_f_from, p_f_to, p_f_po, p_f_due_from, p_f_due_to, p_f_paid, p_f_cis,
         p_f_project, p_f_check, p_dup_only, p_missing_due_date, p_f_credit_card,
-        p_amount_conflict_only, false, NULL::text
+        p_amount_conflict_only, false, NULL::text, p_overdue_only, p_f_confidential
       )
   ),
   filtered_for_missing_count AS (
@@ -205,7 +205,27 @@ CREATE OR REPLACE FUNCTION "public"."aggregate_cost_invoice_summary"("p_f_text" 
         p_f_credit_card,
         false,
         false,
-        NULL::text
+        NULL::text,
+        false,
+        p_f_confidential
+      )
+  ),
+  filtered_for_overdue_count AS (
+    SELECT ci.*
+    FROM public.cost_invoices ci
+    WHERE public.cost_invoice_visible_to_caller(ci)
+      AND public.cost_invoice_passes_filters(
+        ci,
+        p_f_text, p_f_description, p_f_treatment, p_f_status, p_f_doc_type, p_f_company,
+        p_f_from, p_f_to, p_f_po, p_f_due_from, p_f_due_to, p_f_paid, p_f_cis,
+        p_f_project, p_f_check, p_dup_only,
+        false,
+        p_f_credit_card,
+        false,
+        false,
+        NULL::text,
+        false,
+        p_f_confidential
       )
   ),
   missing_due_date_count AS (
@@ -213,6 +233,27 @@ CREATE OR REPLACE FUNCTION "public"."aggregate_cost_invoice_summary"("p_f_text" 
     FROM filtered_for_missing_count f
     WHERE f.due_date IS NULL
       AND coalesce(f.document_type, 'invoice') <> 'pro_forma'
+  ),
+  overdue_stats AS (
+    SELECT
+      count(*)::bigint AS cnt,
+      coalesce(sum(
+        coalesce(
+          f.total_amount,
+          CASE
+            WHEN f.vat_treatment = 'reverse_charge' THEN
+              coalesce(f.net_amount, 0) - coalesce(f.cis_amount, 0)
+            ELSE
+              coalesce(f.net_amount, 0) + coalesce(f.vat_amount, 0)
+          END
+        )
+      ), 0) AS total
+    FROM filtered_for_overdue_count f
+    WHERE f.status = 'reviewed'
+      AND f.paid_at IS NULL
+      AND f.due_date IS NOT NULL
+      AND f.due_date < current_date
+      AND NOT (coalesce(f.document_type, 'invoice') = 'pro_forma' AND f.paid_at IS NULL)
   ),
   split_qty AS (
     SELECT coalesce(sum(s.quantity), 0) AS split_quantity_total
@@ -284,6 +325,8 @@ CREATE OR REPLACE FUNCTION "public"."aggregate_cost_invoice_summary"("p_f_text" 
         'unpaidCount', s.unpaid_count,
         'proFormaCount', s.pro_forma_count,
         'missingDueDateCount', (SELECT cnt FROM missing_due_date_count),
+        'overdueCount', (SELECT cnt FROM overdue_stats),
+        'overdueTotal', (SELECT total FROM overdue_stats),
         'splitQuantityTotal', (SELECT split_quantity_total FROM split_qty)
       )
       FROM summary s
@@ -292,7 +335,7 @@ CREATE OR REPLACE FUNCTION "public"."aggregate_cost_invoice_summary"("p_f_text" 
 $$;
 
 
-ALTER FUNCTION "public"."aggregate_cost_invoice_summary"("p_f_text" "text", "p_f_description" "text", "p_f_treatment" "text", "p_f_status" "text", "p_f_doc_type" "text", "p_f_company" "text", "p_f_from" "date", "p_f_to" "date", "p_f_po" "text", "p_f_due_from" "date", "p_f_due_to" "date", "p_f_paid" "text", "p_f_cis" "text", "p_f_project" "text", "p_f_check" "text", "p_dup_only" boolean, "p_missing_due_date" boolean, "p_f_credit_card" "text", "p_amount_conflict_only" boolean) OWNER TO "postgres";
+ALTER FUNCTION "public"."aggregate_cost_invoice_summary"("p_f_text" "text", "p_f_description" "text", "p_f_treatment" "text", "p_f_status" "text", "p_f_doc_type" "text", "p_f_company" "text", "p_f_from" "date", "p_f_to" "date", "p_f_po" "text", "p_f_due_from" "date", "p_f_due_to" "date", "p_f_paid" "text", "p_f_cis" "text", "p_f_project" "text", "p_f_check" "text", "p_dup_only" boolean, "p_missing_due_date" boolean, "p_f_credit_card" "text", "p_amount_conflict_only" boolean, "p_overdue_only" boolean, "p_f_confidential" "text") OWNER TO "postgres";
 
 
 CREATE OR REPLACE FUNCTION "public"."aggregate_cost_invoices"("p_f_text" "text" DEFAULT ''::"text", "p_f_description" "text" DEFAULT ''::"text", "p_f_treatment" "text" DEFAULT ''::"text", "p_f_status" "text" DEFAULT ''::"text", "p_f_doc_type" "text" DEFAULT ''::"text", "p_f_company" "text" DEFAULT ''::"text", "p_f_from" "date" DEFAULT NULL::"date", "p_f_to" "date" DEFAULT NULL::"date", "p_f_po" "text" DEFAULT ''::"text", "p_f_due_from" "date" DEFAULT NULL::"date", "p_f_due_to" "date" DEFAULT NULL::"date", "p_f_paid" "text" DEFAULT ''::"text", "p_f_cis" "text" DEFAULT ''::"text", "p_f_project" "text" DEFAULT ''::"text", "p_f_check" "text" DEFAULT ''::"text", "p_dup_only" boolean DEFAULT false, "p_missing_due_date" boolean DEFAULT false, "p_f_credit_card" "text" DEFAULT ''::"text", "p_amount_conflict_only" boolean DEFAULT false, "p_payment_month" "text" DEFAULT NULL::"text", "p_overdue_only" boolean DEFAULT false) RETURNS "jsonb"
@@ -3219,6 +3262,34 @@ $$;
 
 
 ALTER FUNCTION "public"."find_or_create_cost_supplier"("p_canonical_name" "text") OWNER TO "postgres";
+
+
+CREATE OR REPLACE FUNCTION "public"."fire_lordsbm_nas_folder_consolidation"() RETURNS bigint
+    LANGUAGE "plpgsql" SECURITY DEFINER
+    SET "search_path" TO 'public', 'net'
+    AS $$
+DECLARE
+  v_apikey text;
+BEGIN
+  SELECT decrypted_secret INTO v_apikey
+  FROM vault.decrypted_secrets
+  WHERE name = 'cost_hooks_service_key';
+
+  IF v_apikey IS NULL THEN
+    RETURN NULL;
+  END IF;
+
+  RETURN net.http_post(
+    url := 'https://portal.cjbce.co.uk/api/public/hooks/nas-sync-queue',
+    headers := jsonb_build_object('Content-Type', 'application/json', 'apikey', v_apikey),
+    body := '{}'::jsonb,
+    timeout_milliseconds := 300000
+  );
+END;
+$$;
+
+
+ALTER FUNCTION "public"."fire_lordsbm_nas_folder_consolidation"() OWNER TO "postgres";
 
 
 CREATE OR REPLACE FUNCTION "public"."fire_statement_payment_reconcile_backfill"() RETURNS bigint
@@ -8064,6 +8135,21 @@ CREATE TABLE IF NOT EXISTS "public"."revenue_entries" (
 ALTER TABLE "public"."revenue_entries" OWNER TO "postgres";
 
 
+CREATE TABLE IF NOT EXISTS "public"."revenue_entry_splits" (
+    "id" "uuid" DEFAULT "gen_random_uuid"() NOT NULL,
+    "revenue_entry_id" "uuid" NOT NULL,
+    "position" integer DEFAULT 0 NOT NULL,
+    "project_id" "uuid",
+    "project_other" "text",
+    "amount_net" numeric(12,2) DEFAULT 0 NOT NULL,
+    "created_at" timestamp with time zone DEFAULT "now"() NOT NULL,
+    "updated_at" timestamp with time zone DEFAULT "now"() NOT NULL
+);
+
+
+ALTER TABLE "public"."revenue_entry_splits" OWNER TO "postgres";
+
+
 CREATE TABLE IF NOT EXISTS "public"."role_permissions" (
     "role" "text" NOT NULL,
     "permission" "text" NOT NULL,
@@ -8747,6 +8833,11 @@ ALTER TABLE ONLY "public"."revenue_entries"
 
 
 
+ALTER TABLE ONLY "public"."revenue_entry_splits"
+    ADD CONSTRAINT "revenue_entry_splits_pkey" PRIMARY KEY ("id");
+
+
+
 ALTER TABLE ONLY "public"."role_permissions"
     ADD CONSTRAINT "role_permissions_pkey" PRIMARY KEY ("role", "permission");
 
@@ -9159,6 +9250,14 @@ CREATE INDEX "revenue_entries_recognition_date_idx" ON "public"."revenue_entries
 
 
 
+CREATE INDEX "revenue_entry_splits_project_id_idx" ON "public"."revenue_entry_splits" USING "btree" ("project_id");
+
+
+
+CREATE INDEX "revenue_entry_splits_revenue_entry_id_idx" ON "public"."revenue_entry_splits" USING "btree" ("revenue_entry_id");
+
+
+
 CREATE INDEX "submission_photos_kind_submission_id_idx" ON "public"."submission_photos" USING "btree" ("kind", "submission_id");
 
 
@@ -9508,6 +9607,10 @@ CREATE OR REPLACE TRIGGER "trg_revenue_entries_before_insert" BEFORE INSERT ON "
 
 
 CREATE OR REPLACE TRIGGER "trg_revenue_entries_updated" BEFORE UPDATE ON "public"."revenue_entries" FOR EACH ROW EXECUTE FUNCTION "public"."set_updated_at"();
+
+
+
+CREATE OR REPLACE TRIGGER "trg_revenue_entry_splits_updated" BEFORE UPDATE ON "public"."revenue_entry_splits" FOR EACH ROW EXECUTE FUNCTION "public"."set_updated_at"();
 
 
 
@@ -9866,6 +9969,16 @@ ALTER TABLE ONLY "public"."revenue_entries"
 
 ALTER TABLE ONLY "public"."revenue_entries"
     ADD CONSTRAINT "revenue_entries_project_id_fkey" FOREIGN KEY ("project_id") REFERENCES "public"."projects"("id") ON DELETE SET NULL;
+
+
+
+ALTER TABLE ONLY "public"."revenue_entry_splits"
+    ADD CONSTRAINT "revenue_entry_splits_project_id_fkey" FOREIGN KEY ("project_id") REFERENCES "public"."projects"("id") ON DELETE SET NULL;
+
+
+
+ALTER TABLE ONLY "public"."revenue_entry_splits"
+    ADD CONSTRAINT "revenue_entry_splits_revenue_entry_id_fkey" FOREIGN KEY ("revenue_entry_id") REFERENCES "public"."revenue_entries"("id") ON DELETE CASCADE;
 
 
 
@@ -10706,6 +10819,13 @@ CREATE POLICY "revenue_entries invoices permission" ON "public"."revenue_entries
 
 
 
+ALTER TABLE "public"."revenue_entry_splits" ENABLE ROW LEVEL SECURITY;
+
+
+CREATE POLICY "revenue_entry_splits invoices permission" ON "public"."revenue_entry_splits" TO "authenticated" USING ("public"."has_permission"("auth"."uid"(), 'access.invoices'::"text", false)) WITH CHECK ("public"."has_permission"("auth"."uid"(), 'access.invoices'::"text", false));
+
+
+
 ALTER TABLE "public"."role_permissions" ENABLE ROW LEVEL SECURITY;
 
 
@@ -11380,9 +11500,10 @@ GRANT ALL ON FUNCTION "public"."admin_set_vault_secret"("p_name" "text", "p_valu
 
 
 
-GRANT ALL ON FUNCTION "public"."aggregate_cost_invoice_summary"("p_f_text" "text", "p_f_description" "text", "p_f_treatment" "text", "p_f_status" "text", "p_f_doc_type" "text", "p_f_company" "text", "p_f_from" "date", "p_f_to" "date", "p_f_po" "text", "p_f_due_from" "date", "p_f_due_to" "date", "p_f_paid" "text", "p_f_cis" "text", "p_f_project" "text", "p_f_check" "text", "p_dup_only" boolean, "p_missing_due_date" boolean, "p_f_credit_card" "text", "p_amount_conflict_only" boolean) TO "anon";
-GRANT ALL ON FUNCTION "public"."aggregate_cost_invoice_summary"("p_f_text" "text", "p_f_description" "text", "p_f_treatment" "text", "p_f_status" "text", "p_f_doc_type" "text", "p_f_company" "text", "p_f_from" "date", "p_f_to" "date", "p_f_po" "text", "p_f_due_from" "date", "p_f_due_to" "date", "p_f_paid" "text", "p_f_cis" "text", "p_f_project" "text", "p_f_check" "text", "p_dup_only" boolean, "p_missing_due_date" boolean, "p_f_credit_card" "text", "p_amount_conflict_only" boolean) TO "authenticated";
-GRANT ALL ON FUNCTION "public"."aggregate_cost_invoice_summary"("p_f_text" "text", "p_f_description" "text", "p_f_treatment" "text", "p_f_status" "text", "p_f_doc_type" "text", "p_f_company" "text", "p_f_from" "date", "p_f_to" "date", "p_f_po" "text", "p_f_due_from" "date", "p_f_due_to" "date", "p_f_paid" "text", "p_f_cis" "text", "p_f_project" "text", "p_f_check" "text", "p_dup_only" boolean, "p_missing_due_date" boolean, "p_f_credit_card" "text", "p_amount_conflict_only" boolean) TO "service_role";
+REVOKE ALL ON FUNCTION "public"."aggregate_cost_invoice_summary"("p_f_text" "text", "p_f_description" "text", "p_f_treatment" "text", "p_f_status" "text", "p_f_doc_type" "text", "p_f_company" "text", "p_f_from" "date", "p_f_to" "date", "p_f_po" "text", "p_f_due_from" "date", "p_f_due_to" "date", "p_f_paid" "text", "p_f_cis" "text", "p_f_project" "text", "p_f_check" "text", "p_dup_only" boolean, "p_missing_due_date" boolean, "p_f_credit_card" "text", "p_amount_conflict_only" boolean, "p_overdue_only" boolean, "p_f_confidential" "text") FROM PUBLIC;
+GRANT ALL ON FUNCTION "public"."aggregate_cost_invoice_summary"("p_f_text" "text", "p_f_description" "text", "p_f_treatment" "text", "p_f_status" "text", "p_f_doc_type" "text", "p_f_company" "text", "p_f_from" "date", "p_f_to" "date", "p_f_po" "text", "p_f_due_from" "date", "p_f_due_to" "date", "p_f_paid" "text", "p_f_cis" "text", "p_f_project" "text", "p_f_check" "text", "p_dup_only" boolean, "p_missing_due_date" boolean, "p_f_credit_card" "text", "p_amount_conflict_only" boolean, "p_overdue_only" boolean, "p_f_confidential" "text") TO "anon";
+GRANT ALL ON FUNCTION "public"."aggregate_cost_invoice_summary"("p_f_text" "text", "p_f_description" "text", "p_f_treatment" "text", "p_f_status" "text", "p_f_doc_type" "text", "p_f_company" "text", "p_f_from" "date", "p_f_to" "date", "p_f_po" "text", "p_f_due_from" "date", "p_f_due_to" "date", "p_f_paid" "text", "p_f_cis" "text", "p_f_project" "text", "p_f_check" "text", "p_dup_only" boolean, "p_missing_due_date" boolean, "p_f_credit_card" "text", "p_amount_conflict_only" boolean, "p_overdue_only" boolean, "p_f_confidential" "text") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."aggregate_cost_invoice_summary"("p_f_text" "text", "p_f_description" "text", "p_f_treatment" "text", "p_f_status" "text", "p_f_doc_type" "text", "p_f_company" "text", "p_f_from" "date", "p_f_to" "date", "p_f_po" "text", "p_f_due_from" "date", "p_f_due_to" "date", "p_f_paid" "text", "p_f_cis" "text", "p_f_project" "text", "p_f_check" "text", "p_dup_only" boolean, "p_missing_due_date" boolean, "p_f_credit_card" "text", "p_amount_conflict_only" boolean, "p_overdue_only" boolean, "p_f_confidential" "text") TO "service_role";
 
 
 
@@ -11877,6 +11998,11 @@ GRANT ALL ON FUNCTION "public"."enforce_todo_item_update_permissions"() TO "serv
 REVOKE ALL ON FUNCTION "public"."find_or_create_cost_supplier"("p_canonical_name" "text") FROM PUBLIC;
 GRANT ALL ON FUNCTION "public"."find_or_create_cost_supplier"("p_canonical_name" "text") TO "authenticated";
 GRANT ALL ON FUNCTION "public"."find_or_create_cost_supplier"("p_canonical_name" "text") TO "service_role";
+
+
+
+REVOKE ALL ON FUNCTION "public"."fire_lordsbm_nas_folder_consolidation"() FROM PUBLIC;
+GRANT ALL ON FUNCTION "public"."fire_lordsbm_nas_folder_consolidation"() TO "service_role";
 
 
 
@@ -12777,6 +12903,12 @@ GRANT ALL ON TABLE "public"."rams_documents" TO "service_role";
 GRANT ALL ON TABLE "public"."revenue_entries" TO "anon";
 GRANT ALL ON TABLE "public"."revenue_entries" TO "authenticated";
 GRANT ALL ON TABLE "public"."revenue_entries" TO "service_role";
+
+
+
+GRANT ALL ON TABLE "public"."revenue_entry_splits" TO "anon";
+GRANT ALL ON TABLE "public"."revenue_entry_splits" TO "authenticated";
+GRANT ALL ON TABLE "public"."revenue_entry_splits" TO "service_role";
 
 
 
