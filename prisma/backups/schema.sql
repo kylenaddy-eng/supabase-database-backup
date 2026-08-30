@@ -6951,6 +6951,87 @@ $$;
 ALTER FUNCTION "public"."trigger_cost_scan"("p_url" "text", "p_apikey" "text") OWNER TO "postgres";
 
 
+CREATE OR REPLACE FUNCTION "public"."trigger_nas_sync_dispatch_on_enqueue"() RETURNS "trigger"
+    LANGUAGE "plpgsql" SECURITY DEFINER
+    SET "search_path" TO 'public'
+    AS $$
+DECLARE
+  v_apikey text;
+  v_github_token text;
+BEGIN
+  IF NEW.status IS DISTINCT FROM 'pending' THEN
+    RETURN NEW;
+  END IF;
+
+  IF NEW.kind NOT IN (
+    'timesheet',
+    'plant_inspection',
+    'vehicle_defect',
+    'rams_briefing',
+    'starter',
+    'havs_log',
+    'toolbox_talk',
+    'daily_briefing'
+  ) THEN
+    RETURN NEW;
+  END IF;
+
+  SELECT decrypted_secret INTO v_github_token
+  FROM vault.decrypted_secrets
+  WHERE name = 'github_dispatch_token';
+
+  IF v_github_token IS NOT NULL AND v_github_token <> '' THEN
+    PERFORM net.http_post(
+      url := 'https://api.github.com/repos/CJB-Civil-Engineering-Ltd/project-data-hub/dispatches',
+      headers := jsonb_build_object(
+        'Authorization', 'Bearer ' || v_github_token,
+        'Accept', 'application/vnd.github+json',
+        'X-GitHub-Api-Version', '2022-11-28',
+        'Content-Type', 'application/json',
+        'User-Agent', 'cjb-project-data-hub-nas-sync'
+      ),
+      body := jsonb_build_object(
+        'event_type', 'nas-sync-stage',
+        'client_payload', jsonb_build_object(
+          'kind', NEW.kind,
+          'submission_id', NEW.submission_id
+        )
+      ),
+      timeout_milliseconds := 15000
+    );
+    RETURN NEW;
+  END IF;
+
+  SELECT decrypted_secret INTO v_apikey
+  FROM vault.decrypted_secrets
+  WHERE name = 'cost_hooks_service_key';
+
+  IF v_apikey IS NULL OR v_apikey = '' THEN
+    RAISE WARNING 'nas_sync dispatch trigger: github_dispatch_token and cost_hooks_service_key both missing';
+    RETURN NEW;
+  END IF;
+
+  PERFORM net.http_post(
+    url := 'https://portal.cjbce.co.uk/api/public/hooks/nas-sync-dispatch',
+    headers := jsonb_build_object(
+      'Content-Type', 'application/json',
+      'apikey', v_apikey
+    ),
+    body := jsonb_build_object(
+      'kind', NEW.kind,
+      'submissionId', NEW.submission_id
+    ),
+    timeout_milliseconds := 15000
+  );
+
+  RETURN NEW;
+END;
+$$;
+
+
+ALTER FUNCTION "public"."trigger_nas_sync_dispatch_on_enqueue"() OWNER TO "postgres";
+
+
 CREATE OR REPLACE FUNCTION "public"."trigger_statement_scan"("p_url" "text", "p_apikey" "text") RETURNS bigint
     LANGUAGE "plpgsql" SECURITY DEFINER
     SET "search_path" TO 'public', 'net'
@@ -9499,6 +9580,10 @@ CREATE OR REPLACE TRIGGER "holidays_set_updated_at" BEFORE UPDATE ON "public"."h
 
 
 CREATE OR REPLACE TRIGGER "invoices_search_document" BEFORE INSERT OR UPDATE OF "invoice_number", "client_name_snapshot", "client_reference", "purchase_order", "site_name", "description" ON "public"."invoices" FOR EACH ROW EXECUTE FUNCTION "public"."invoices_search_document_trigger"();
+
+
+
+CREATE OR REPLACE TRIGGER "nas_sync_queue_dispatch_on_insert" AFTER INSERT ON "public"."nas_sync_queue" FOR EACH ROW EXECUTE FUNCTION "public"."trigger_nas_sync_dispatch_on_enqueue"();
 
 
 
@@ -12473,6 +12558,12 @@ GRANT ALL ON FUNCTION "public"."toolbox_autoapprove"() TO "service_role";
 REVOKE ALL ON FUNCTION "public"."trigger_cost_scan"("p_url" "text", "p_apikey" "text") FROM PUBLIC;
 GRANT ALL ON FUNCTION "public"."trigger_cost_scan"("p_url" "text", "p_apikey" "text") TO "service_role";
 GRANT ALL ON FUNCTION "public"."trigger_cost_scan"("p_url" "text", "p_apikey" "text") TO "authenticated";
+
+
+
+GRANT ALL ON FUNCTION "public"."trigger_nas_sync_dispatch_on_enqueue"() TO "anon";
+GRANT ALL ON FUNCTION "public"."trigger_nas_sync_dispatch_on_enqueue"() TO "authenticated";
+GRANT ALL ON FUNCTION "public"."trigger_nas_sync_dispatch_on_enqueue"() TO "service_role";
 
 
 
