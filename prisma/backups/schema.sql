@@ -5583,7 +5583,7 @@ $$;
 ALTER FUNCTION "public"."mark_cost_invoices_paid_by_ids"("p_ids" "uuid"[], "p_paid" boolean) OWNER TO "postgres";
 
 
-CREATE OR REPLACE FUNCTION "public"."mark_cost_invoices_paid_filtered"("p_f_text" "text" DEFAULT ''::"text", "p_f_description" "text" DEFAULT ''::"text", "p_f_treatment" "text" DEFAULT ''::"text", "p_f_status" "text" DEFAULT ''::"text", "p_f_doc_type" "text" DEFAULT ''::"text", "p_f_company" "text" DEFAULT ''::"text", "p_f_from" "date" DEFAULT NULL::"date", "p_f_to" "date" DEFAULT NULL::"date", "p_f_po" "text" DEFAULT ''::"text", "p_f_due_from" "date" DEFAULT NULL::"date", "p_f_due_to" "date" DEFAULT NULL::"date", "p_f_paid" "text" DEFAULT 'unpaid'::"text", "p_f_cis" "text" DEFAULT ''::"text", "p_f_project" "text" DEFAULT ''::"text", "p_f_check" "text" DEFAULT ''::"text", "p_dup_only" boolean DEFAULT false, "p_missing_due_date" boolean DEFAULT false, "p_f_credit_card" "text" DEFAULT ''::"text", "p_amount_conflict_only" boolean DEFAULT false, "p_paid" boolean DEFAULT true, "p_selected_ids" "uuid"[] DEFAULT NULL::"uuid"[], "p_f_payment_reminded" boolean DEFAULT false, "p_payment_reminder_month" "text" DEFAULT NULL::"text", "p_overdue_only" boolean DEFAULT false, "p_f_confidential" "text" DEFAULT ''::"text", "p_f_vehicle_service" "text" DEFAULT ''::"text") RETURNS TABLE("updated_count" bigint, "snapshot" "jsonb")
+CREATE OR REPLACE FUNCTION "public"."mark_cost_invoices_paid_filtered"("p_f_text" "text" DEFAULT ''::"text", "p_f_description" "text" DEFAULT ''::"text", "p_f_treatment" "text" DEFAULT ''::"text", "p_f_status" "text" DEFAULT ''::"text", "p_f_doc_type" "text" DEFAULT ''::"text", "p_f_company" "text" DEFAULT ''::"text", "p_f_from" "date" DEFAULT NULL::"date", "p_f_to" "date" DEFAULT NULL::"date", "p_f_po" "text" DEFAULT ''::"text", "p_f_due_from" "date" DEFAULT NULL::"date", "p_f_due_to" "date" DEFAULT NULL::"date", "p_f_paid" "text" DEFAULT 'unpaid'::"text", "p_f_cis" "text" DEFAULT ''::"text", "p_f_project" "text" DEFAULT ''::"text", "p_f_check" "text" DEFAULT ''::"text", "p_dup_only" boolean DEFAULT false, "p_missing_due_date" boolean DEFAULT false, "p_f_credit_card" "text" DEFAULT ''::"text", "p_amount_conflict_only" boolean DEFAULT false, "p_paid" boolean DEFAULT true, "p_selected_ids" "uuid"[] DEFAULT NULL::"uuid"[], "p_f_payment_reminded" boolean DEFAULT false, "p_payment_reminder_month" "text" DEFAULT NULL::"text", "p_overdue_only" boolean DEFAULT false, "p_f_confidential" "text" DEFAULT ''::"text", "p_f_vehicle_service" "text" DEFAULT ''::"text", "p_f_vehicle_id" "uuid" DEFAULT NULL::"uuid") RETURNS TABLE("updated_count" bigint, "snapshot" "jsonb")
     LANGUAGE "plpgsql" SECURITY DEFINER
     SET "search_path" TO 'public'
     AS $$
@@ -5594,7 +5594,7 @@ DECLARE
   v_count bigint;
   v_snapshot jsonb;
 BEGIN
-  PERFORM public.assert_rpc_admin();
+  PERFORM public.assert_rpc_costs();
   PERFORM set_config('audit.suppress_row_trigger', 'on', true);
 
   WITH targets AS (
@@ -5609,7 +5609,7 @@ BEGIN
         p_f_from, p_f_to, p_f_po, p_f_due_from, p_f_due_to, p_f_paid, p_f_cis,
         p_f_project, p_f_check, p_dup_only, p_missing_due_date, p_f_credit_card,
         p_amount_conflict_only, p_f_payment_reminded, p_payment_reminder_month, p_overdue_only,
-        p_f_confidential, p_f_vehicle_service
+        p_f_confidential, p_f_vehicle_service, p_f_vehicle_id
       )
   ),
   snap AS (
@@ -5663,7 +5663,7 @@ END;
 $$;
 
 
-ALTER FUNCTION "public"."mark_cost_invoices_paid_filtered"("p_f_text" "text", "p_f_description" "text", "p_f_treatment" "text", "p_f_status" "text", "p_f_doc_type" "text", "p_f_company" "text", "p_f_from" "date", "p_f_to" "date", "p_f_po" "text", "p_f_due_from" "date", "p_f_due_to" "date", "p_f_paid" "text", "p_f_cis" "text", "p_f_project" "text", "p_f_check" "text", "p_dup_only" boolean, "p_missing_due_date" boolean, "p_f_credit_card" "text", "p_amount_conflict_only" boolean, "p_paid" boolean, "p_selected_ids" "uuid"[], "p_f_payment_reminded" boolean, "p_payment_reminder_month" "text", "p_overdue_only" boolean, "p_f_confidential" "text", "p_f_vehicle_service" "text") OWNER TO "postgres";
+ALTER FUNCTION "public"."mark_cost_invoices_paid_filtered"("p_f_text" "text", "p_f_description" "text", "p_f_treatment" "text", "p_f_status" "text", "p_f_doc_type" "text", "p_f_company" "text", "p_f_from" "date", "p_f_to" "date", "p_f_po" "text", "p_f_due_from" "date", "p_f_due_to" "date", "p_f_paid" "text", "p_f_cis" "text", "p_f_project" "text", "p_f_check" "text", "p_dup_only" boolean, "p_missing_due_date" boolean, "p_f_credit_card" "text", "p_amount_conflict_only" boolean, "p_paid" boolean, "p_selected_ids" "uuid"[], "p_f_payment_reminded" boolean, "p_payment_reminder_month" "text", "p_overdue_only" boolean, "p_f_confidential" "text", "p_f_vehicle_service" "text", "p_f_vehicle_id" "uuid") OWNER TO "postgres";
 
 
 CREATE OR REPLACE FUNCTION "public"."match_subcontractor_by_company"("p_company" "text") RETURNS "uuid"
@@ -12476,9 +12476,9 @@ GRANT ALL ON FUNCTION "public"."mark_cost_invoices_paid_by_ids"("p_ids" "uuid"[]
 
 
 
-GRANT ALL ON FUNCTION "public"."mark_cost_invoices_paid_filtered"("p_f_text" "text", "p_f_description" "text", "p_f_treatment" "text", "p_f_status" "text", "p_f_doc_type" "text", "p_f_company" "text", "p_f_from" "date", "p_f_to" "date", "p_f_po" "text", "p_f_due_from" "date", "p_f_due_to" "date", "p_f_paid" "text", "p_f_cis" "text", "p_f_project" "text", "p_f_check" "text", "p_dup_only" boolean, "p_missing_due_date" boolean, "p_f_credit_card" "text", "p_amount_conflict_only" boolean, "p_paid" boolean, "p_selected_ids" "uuid"[], "p_f_payment_reminded" boolean, "p_payment_reminder_month" "text", "p_overdue_only" boolean, "p_f_confidential" "text", "p_f_vehicle_service" "text") TO "anon";
-GRANT ALL ON FUNCTION "public"."mark_cost_invoices_paid_filtered"("p_f_text" "text", "p_f_description" "text", "p_f_treatment" "text", "p_f_status" "text", "p_f_doc_type" "text", "p_f_company" "text", "p_f_from" "date", "p_f_to" "date", "p_f_po" "text", "p_f_due_from" "date", "p_f_due_to" "date", "p_f_paid" "text", "p_f_cis" "text", "p_f_project" "text", "p_f_check" "text", "p_dup_only" boolean, "p_missing_due_date" boolean, "p_f_credit_card" "text", "p_amount_conflict_only" boolean, "p_paid" boolean, "p_selected_ids" "uuid"[], "p_f_payment_reminded" boolean, "p_payment_reminder_month" "text", "p_overdue_only" boolean, "p_f_confidential" "text", "p_f_vehicle_service" "text") TO "authenticated";
-GRANT ALL ON FUNCTION "public"."mark_cost_invoices_paid_filtered"("p_f_text" "text", "p_f_description" "text", "p_f_treatment" "text", "p_f_status" "text", "p_f_doc_type" "text", "p_f_company" "text", "p_f_from" "date", "p_f_to" "date", "p_f_po" "text", "p_f_due_from" "date", "p_f_due_to" "date", "p_f_paid" "text", "p_f_cis" "text", "p_f_project" "text", "p_f_check" "text", "p_dup_only" boolean, "p_missing_due_date" boolean, "p_f_credit_card" "text", "p_amount_conflict_only" boolean, "p_paid" boolean, "p_selected_ids" "uuid"[], "p_f_payment_reminded" boolean, "p_payment_reminder_month" "text", "p_overdue_only" boolean, "p_f_confidential" "text", "p_f_vehicle_service" "text") TO "service_role";
+GRANT ALL ON FUNCTION "public"."mark_cost_invoices_paid_filtered"("p_f_text" "text", "p_f_description" "text", "p_f_treatment" "text", "p_f_status" "text", "p_f_doc_type" "text", "p_f_company" "text", "p_f_from" "date", "p_f_to" "date", "p_f_po" "text", "p_f_due_from" "date", "p_f_due_to" "date", "p_f_paid" "text", "p_f_cis" "text", "p_f_project" "text", "p_f_check" "text", "p_dup_only" boolean, "p_missing_due_date" boolean, "p_f_credit_card" "text", "p_amount_conflict_only" boolean, "p_paid" boolean, "p_selected_ids" "uuid"[], "p_f_payment_reminded" boolean, "p_payment_reminder_month" "text", "p_overdue_only" boolean, "p_f_confidential" "text", "p_f_vehicle_service" "text", "p_f_vehicle_id" "uuid") TO "anon";
+GRANT ALL ON FUNCTION "public"."mark_cost_invoices_paid_filtered"("p_f_text" "text", "p_f_description" "text", "p_f_treatment" "text", "p_f_status" "text", "p_f_doc_type" "text", "p_f_company" "text", "p_f_from" "date", "p_f_to" "date", "p_f_po" "text", "p_f_due_from" "date", "p_f_due_to" "date", "p_f_paid" "text", "p_f_cis" "text", "p_f_project" "text", "p_f_check" "text", "p_dup_only" boolean, "p_missing_due_date" boolean, "p_f_credit_card" "text", "p_amount_conflict_only" boolean, "p_paid" boolean, "p_selected_ids" "uuid"[], "p_f_payment_reminded" boolean, "p_payment_reminder_month" "text", "p_overdue_only" boolean, "p_f_confidential" "text", "p_f_vehicle_service" "text", "p_f_vehicle_id" "uuid") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."mark_cost_invoices_paid_filtered"("p_f_text" "text", "p_f_description" "text", "p_f_treatment" "text", "p_f_status" "text", "p_f_doc_type" "text", "p_f_company" "text", "p_f_from" "date", "p_f_to" "date", "p_f_po" "text", "p_f_due_from" "date", "p_f_due_to" "date", "p_f_paid" "text", "p_f_cis" "text", "p_f_project" "text", "p_f_check" "text", "p_dup_only" boolean, "p_missing_due_date" boolean, "p_f_credit_card" "text", "p_amount_conflict_only" boolean, "p_paid" boolean, "p_selected_ids" "uuid"[], "p_f_payment_reminded" boolean, "p_payment_reminder_month" "text", "p_overdue_only" boolean, "p_f_confidential" "text", "p_f_vehicle_service" "text", "p_f_vehicle_id" "uuid") TO "service_role";
 
 
 
