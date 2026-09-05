@@ -7036,7 +7036,8 @@ BEGIN
     'starter',
     'havs_log',
     'toolbox_talk',
-    'daily_briefing'
+    'daily_briefing',
+    'invoice'
   ) THEN
     RETURN NEW;
   END IF;
