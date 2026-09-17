@@ -8948,11 +8948,6 @@ ALTER TABLE ONLY "public"."cost_dated_scans"
 
 
 
-ALTER TABLE ONLY "public"."cost_dated_scans"
-    ADD CONSTRAINT "cost_dated_scans_since_ms_until_ms_key" UNIQUE ("since_ms", "until_ms");
-
-
-
 ALTER TABLE ONLY "public"."cost_invoice_splits"
     ADD CONSTRAINT "cost_invoice_splits_pkey" PRIMARY KEY ("id");
 
@@ -9409,6 +9404,10 @@ CREATE INDEX "audit_log_parent_idx" ON "public"."audit_log" USING "btree" ("pare
 
 
 
+CREATE UNIQUE INDEX "cost_dated_scans_window_account_uniq" ON "public"."cost_dated_scans" USING "btree" ("since_ms", "until_ms", "account_id");
+
+
+
 CREATE UNIQUE INDEX "cost_invoice_monthly_rollups_pk" ON "public"."cost_invoice_monthly_rollups" USING "btree" ("month_start", "company_name");
 
 
@@ -9446,6 +9445,14 @@ CREATE INDEX "cost_invoices_full_field_dedupe_key_idx" ON "public"."cost_invoice
 
 
 CREATE INDEX "cost_invoices_invoice_date_idx" ON "public"."cost_invoices" USING "btree" ("invoice_date" DESC);
+
+
+
+CREATE INDEX "cost_invoices_linked_proforma_msgid_idx" ON "public"."cost_invoices" USING "btree" ((("linked_documents" #>> '{pro_forma,source_message_id}'::"text"[]))) WHERE (("linked_documents" #>> '{pro_forma,source_message_id}'::"text"[]) IS NOT NULL);
+
+
+
+CREATE INDEX "cost_invoices_linked_proforma_sha_idx" ON "public"."cost_invoices" USING "btree" ((("linked_documents" #>> '{pro_forma,attachment_sha256}'::"text"[]))) WHERE (("linked_documents" #>> '{pro_forma,attachment_sha256}'::"text"[]) IS NOT NULL);
 
 
 
@@ -9698,6 +9705,18 @@ CREATE INDEX "timesheet_days_timesheet_id_day_idx" ON "public"."timesheet_days" 
 
 
 CREATE INDEX "timesheet_pending_amendment_days_timesheet_id_idx" ON "public"."timesheet_pending_amendment_days" USING "btree" ("timesheet_id");
+
+
+
+CREATE INDEX "timesheets_change_requested_at_idx" ON "public"."timesheets" USING "btree" ("change_requested_at" DESC) WHERE ("change_requested_at" IS NOT NULL);
+
+
+
+CREATE INDEX "timesheets_status_week_ending_idx" ON "public"."timesheets" USING "btree" ("status", "week_ending" DESC);
+
+
+
+CREATE INDEX "timesheets_submitted_created_at_idx" ON "public"."timesheets" USING "btree" ("created_at" DESC) WHERE ("status" = 'submitted'::"public"."submission_status");
 
 
 
