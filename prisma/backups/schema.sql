@@ -784,14 +784,13 @@ $_$;
 ALTER FUNCTION "public"."aggregate_cost_invoices"("p_f_text" "text", "p_f_description" "text", "p_f_treatment" "text", "p_f_status" "text", "p_f_doc_type" "text", "p_f_company" "text", "p_f_from" "date", "p_f_to" "date", "p_f_po" "text", "p_f_due_from" "date", "p_f_due_to" "date", "p_f_paid" "text", "p_f_cis" "text", "p_f_project" "text", "p_f_check" "text", "p_dup_only" boolean, "p_missing_due_date" boolean, "p_f_credit_card" "text", "p_amount_conflict_only" boolean, "p_payment_month" "text", "p_overdue_only" boolean, "p_f_confidential" "text", "p_f_vehicle_service" "text", "p_f_vehicle_id" "uuid") OWNER TO "postgres";
 
 
-CREATE OR REPLACE FUNCTION "public"."aggregate_invoices"("p_f_text" "text" DEFAULT ''::"text", "p_f_client" "uuid" DEFAULT NULL::"uuid", "p_f_from" "date" DEFAULT NULL::"date", "p_f_to" "date" DEFAULT NULL::"date", "p_f_vat" "text" DEFAULT ''::"text", "p_f_project" "uuid" DEFAULT NULL::"uuid") RETURNS "jsonb"
+CREATE OR REPLACE FUNCTION "public"."aggregate_invoices"("p_f_text" "text" DEFAULT ''::"text", "p_f_client" "uuid" DEFAULT NULL::"uuid", "p_f_from" "date" DEFAULT NULL::"date", "p_f_to" "date" DEFAULT NULL::"date", "p_f_vat" "text" DEFAULT ''::"text", "p_f_project" "text" DEFAULT NULL::"text") RETURNS "jsonb"
     LANGUAGE "sql" STABLE SECURITY DEFINER
     SET "search_path" TO 'public'
     AS $$
-  WITH auth_guard AS (SELECT public.assert_rpc_admin() AS _), filtered AS (
+  WITH filtered AS (
     SELECT i.*
     FROM public.invoices i
-    CROSS JOIN auth_guard
     WHERE public.outgoing_invoice_passes_filters(
       i, p_f_text, p_f_client, p_f_from, p_f_to, p_f_vat, p_f_project
     )
@@ -801,13 +800,15 @@ CREATE OR REPLACE FUNCTION "public"."aggregate_invoices"("p_f_text" "text" DEFAU
       f.id,
       coalesce(nullif(trim(f.client_name_snapshot), ''), '—') AS client_name,
       CASE
-        WHEN p_f_project IS NOT NULL THEN (
+        WHEN coalesce(nullif(trim(p_f_project), ''), NULL) IS NULL THEN coalesce(f.amount_net, 0)
+        ELSE (
           SELECT coalesce(sum(il.amount_net), 0)
           FROM public.invoice_lines il
           WHERE il.invoice_id = f.id
-            AND il.project_id = p_f_project
+            AND public.outgoing_invoice_line_matches_project(
+              il.project_id, il.is_overhead, p_f_project
+            )
         )
-        ELSE coalesce(f.amount_net, 0)
       END AS net
     FROM filtered f
   ),
@@ -840,7 +841,7 @@ CREATE OR REPLACE FUNCTION "public"."aggregate_invoices"("p_f_text" "text" DEFAU
 $$;
 
 
-ALTER FUNCTION "public"."aggregate_invoices"("p_f_text" "text", "p_f_client" "uuid", "p_f_from" "date", "p_f_to" "date", "p_f_vat" "text", "p_f_project" "uuid") OWNER TO "postgres";
+ALTER FUNCTION "public"."aggregate_invoices"("p_f_text" "text", "p_f_client" "uuid", "p_f_from" "date", "p_f_to" "date", "p_f_vat" "text", "p_f_project" "text") OWNER TO "postgres";
 
 
 CREATE OR REPLACE FUNCTION "public"."assert_rpc_admin"() RETURNS boolean
@@ -4645,14 +4646,13 @@ $$;
 ALTER FUNCTION "public"."list_cost_supplier_statements"("p_company" "text", "p_received_from" "date", "p_received_to" "date", "p_status" "text", "p_limit" integer, "p_offset" integer, "p_archived_only" boolean) OWNER TO "postgres";
 
 
-CREATE OR REPLACE FUNCTION "public"."list_invoices"("p_f_text" "text" DEFAULT ''::"text", "p_f_client" "uuid" DEFAULT NULL::"uuid", "p_f_from" "date" DEFAULT NULL::"date", "p_f_to" "date" DEFAULT NULL::"date", "p_f_vat" "text" DEFAULT ''::"text", "p_f_project" "uuid" DEFAULT NULL::"uuid", "p_sort_dir" "text" DEFAULT 'desc'::"text", "p_limit" integer DEFAULT 20, "p_offset" integer DEFAULT 0) RETURNS TABLE("id" "uuid", "invoice_number" integer, "invoice_date" "date", "due_date" "date", "client_id" "uuid", "client_name_snapshot" "text", "client_reference" "text", "purchase_order" "text", "site_name" "text", "description" "text", "amount_net" numeric, "display_net" numeric, "vat_mode" "public"."invoice_vat_mode", "nas_path" "text", "nas_pushed_at" timestamp with time zone, "created_at" timestamp with time zone, "line_count" integer, "total_count" bigint)
+CREATE OR REPLACE FUNCTION "public"."list_invoices"("p_f_text" "text" DEFAULT ''::"text", "p_f_client" "uuid" DEFAULT NULL::"uuid", "p_f_from" "date" DEFAULT NULL::"date", "p_f_to" "date" DEFAULT NULL::"date", "p_f_vat" "text" DEFAULT ''::"text", "p_f_project" "text" DEFAULT NULL::"text", "p_sort_dir" "text" DEFAULT 'desc'::"text", "p_limit" integer DEFAULT 20, "p_offset" integer DEFAULT 0) RETURNS TABLE("id" "uuid", "invoice_number" integer, "invoice_date" "date", "due_date" "date", "client_id" "uuid", "client_name_snapshot" "text", "client_reference" "text", "purchase_order" "text", "site_name" "text", "description" "text", "amount_net" numeric, "display_net" numeric, "vat_mode" "public"."invoice_vat_mode", "nas_path" "text", "nas_pushed_at" timestamp with time zone, "created_at" timestamp with time zone, "line_count" integer, "total_count" bigint)
     LANGUAGE "sql" STABLE SECURITY DEFINER
     SET "search_path" TO 'public'
     AS $$
-  WITH auth_guard AS (SELECT public.assert_rpc_admin() AS _), filtered AS (
+  WITH filtered AS (
     SELECT i.*
     FROM public.invoices i
-    CROSS JOIN auth_guard
     WHERE public.outgoing_invoice_passes_filters(
       i, p_f_text, p_f_client, p_f_from, p_f_to, p_f_vat, p_f_project
     )
@@ -4662,13 +4662,15 @@ CREATE OR REPLACE FUNCTION "public"."list_invoices"("p_f_text" "text" DEFAULT ''
       f.*,
       count(*) OVER () AS total_count,
       CASE
-        WHEN p_f_project IS NOT NULL THEN (
+        WHEN coalesce(nullif(trim(p_f_project), ''), NULL) IS NULL THEN coalesce(f.amount_net, 0)
+        ELSE (
           SELECT coalesce(sum(il.amount_net), 0)
           FROM public.invoice_lines il
           WHERE il.invoice_id = f.id
-            AND il.project_id = p_f_project
+            AND public.outgoing_invoice_line_matches_project(
+              il.project_id, il.is_overhead, p_f_project
+            )
         )
-        ELSE coalesce(f.amount_net, 0)
       END AS display_net,
       (
         SELECT count(*)::integer
@@ -4706,7 +4708,7 @@ CREATE OR REPLACE FUNCTION "public"."list_invoices"("p_f_text" "text" DEFAULT ''
 $$;
 
 
-ALTER FUNCTION "public"."list_invoices"("p_f_text" "text", "p_f_client" "uuid", "p_f_from" "date", "p_f_to" "date", "p_f_vat" "text", "p_f_project" "uuid", "p_sort_dir" "text", "p_limit" integer, "p_offset" integer) OWNER TO "postgres";
+ALTER FUNCTION "public"."list_invoices"("p_f_text" "text", "p_f_client" "uuid", "p_f_from" "date", "p_f_to" "date", "p_f_vat" "text", "p_f_project" "text", "p_sort_dir" "text", "p_limit" integer, "p_offset" integer) OWNER TO "postgres";
 
 
 CREATE OR REPLACE FUNCTION "public"."list_submissions_browser"("p_from" "date", "p_to" "date", "p_kinds" "text"[], "p_worker_id" "uuid" DEFAULT NULL::"uuid", "p_group" "text" DEFAULT NULL::"text", "p_client" "uuid" DEFAULT NULL::"uuid", "p_search" "text" DEFAULT NULL::"text", "p_allowed_worker_ids" "uuid"[] DEFAULT NULL::"uuid"[], "p_limit" integer DEFAULT 20, "p_offset" integer DEFAULT 0) RETURNS TABLE("kind" "text", "id" "uuid", "worker_id" "uuid", "who" "text", "group_name" "text", "label" "text", "status" "text", "when_at" timestamp with time zone, "client_id" "uuid", "client_ids" "uuid"[], "repaired" boolean, "total_count" bigint)
@@ -6023,7 +6025,25 @@ $$;
 ALTER FUNCTION "public"."normalize_vat_number"("p_vat" "text") OWNER TO "postgres";
 
 
-CREATE OR REPLACE FUNCTION "public"."outgoing_invoice_passes_filters"("p_inv" "public"."invoices", "p_f_text" "text" DEFAULT ''::"text", "p_f_client" "uuid" DEFAULT NULL::"uuid", "p_f_from" "date" DEFAULT NULL::"date", "p_f_to" "date" DEFAULT NULL::"date", "p_f_vat" "text" DEFAULT ''::"text", "p_f_project" "uuid" DEFAULT NULL::"uuid") RETURNS boolean
+CREATE OR REPLACE FUNCTION "public"."outgoing_invoice_line_matches_project"("p_line_project_id" "uuid", "p_line_is_overhead" boolean, "p_f_project" "text") RETURNS boolean
+    LANGUAGE "sql" IMMUTABLE
+    SET "search_path" TO 'public'
+    AS $$
+  SELECT CASE
+    WHEN coalesce(nullif(trim(p_f_project), ''), NULL) IS NULL THEN true
+    WHEN trim(p_f_project) = '__overhead' THEN coalesce(p_line_is_overhead, false)
+    ELSE
+      NOT coalesce(p_line_is_overhead, false)
+      AND p_line_project_id IS NOT NULL
+      AND p_line_project_id::text = trim(p_f_project)
+  END;
+$$;
+
+
+ALTER FUNCTION "public"."outgoing_invoice_line_matches_project"("p_line_project_id" "uuid", "p_line_is_overhead" boolean, "p_f_project" "text") OWNER TO "postgres";
+
+
+CREATE OR REPLACE FUNCTION "public"."outgoing_invoice_passes_filters"("p_inv" "public"."invoices", "p_f_text" "text" DEFAULT ''::"text", "p_f_client" "uuid" DEFAULT NULL::"uuid", "p_f_from" "date" DEFAULT NULL::"date", "p_f_to" "date" DEFAULT NULL::"date", "p_f_vat" "text" DEFAULT ''::"text", "p_f_project" "text" DEFAULT NULL::"text") RETURNS boolean
     LANGUAGE "sql" STABLE
     SET "search_path" TO 'public'
     AS $$
@@ -6036,12 +6056,14 @@ CREATE OR REPLACE FUNCTION "public"."outgoing_invoice_passes_filters"("p_inv" "p
       OR p_inv.vat_mode::text = trim(p_f_vat)
     )
     AND (
-      p_f_project IS NULL
+      coalesce(nullif(trim(p_f_project), ''), NULL) IS NULL
       OR EXISTS (
         SELECT 1
         FROM public.invoice_lines il
         WHERE il.invoice_id = p_inv.id
-          AND il.project_id = p_f_project
+          AND public.outgoing_invoice_line_matches_project(
+            il.project_id, il.is_overhead, p_f_project
+          )
       )
     )
     AND (
@@ -6059,13 +6081,14 @@ CREATE OR REPLACE FUNCTION "public"."outgoing_invoice_passes_filters"("p_inv" "p
             OR il.project_other ILIKE '%' || trim(p_f_text) || '%'
             OR p.code ILIKE '%' || trim(p_f_text) || '%'
             OR p.description ILIKE '%' || trim(p_f_text) || '%'
+            OR (il.is_overhead AND 'overhead' ILIKE '%' || trim(p_f_text) || '%')
           )
       )
     );
 $$;
 
 
-ALTER FUNCTION "public"."outgoing_invoice_passes_filters"("p_inv" "public"."invoices", "p_f_text" "text", "p_f_client" "uuid", "p_f_from" "date", "p_f_to" "date", "p_f_vat" "text", "p_f_project" "uuid") OWNER TO "postgres";
+ALTER FUNCTION "public"."outgoing_invoice_passes_filters"("p_inv" "public"."invoices", "p_f_text" "text", "p_f_client" "uuid", "p_f_from" "date", "p_f_to" "date", "p_f_vat" "text", "p_f_project" "text") OWNER TO "postgres";
 
 
 CREATE OR REPLACE FUNCTION "public"."owns_submission"("_kind" "public"."submission_kind", "_submission_id" "uuid") RETURNS boolean
@@ -8195,7 +8218,8 @@ CREATE TABLE IF NOT EXISTS "public"."invoice_lines" (
     "quantity" numeric(12,4),
     "unit" "text",
     "rate" numeric(12,2),
-    "description_title" "text"
+    "description_title" "text",
+    "is_overhead" boolean DEFAULT false NOT NULL
 );
 
 
@@ -9613,6 +9637,10 @@ CREATE INDEX "idx_push_subscriptions_user_id" ON "public"."push_subscriptions" U
 
 
 CREATE UNIQUE INDEX "integration_storage_active_uniq" ON "public"."integration_storage_backends" USING "btree" ("is_active") WHERE "is_active";
+
+
+
+CREATE INDEX "invoice_lines_overhead_idx" ON "public"."invoice_lines" USING "btree" ("invoice_id") WHERE "is_overhead";
 
 
 
@@ -12014,9 +12042,10 @@ GRANT ALL ON FUNCTION "public"."aggregate_cost_invoices"("p_f_text" "text", "p_f
 
 
 
-REVOKE ALL ON FUNCTION "public"."aggregate_invoices"("p_f_text" "text", "p_f_client" "uuid", "p_f_from" "date", "p_f_to" "date", "p_f_vat" "text", "p_f_project" "uuid") FROM PUBLIC;
-GRANT ALL ON FUNCTION "public"."aggregate_invoices"("p_f_text" "text", "p_f_client" "uuid", "p_f_from" "date", "p_f_to" "date", "p_f_vat" "text", "p_f_project" "uuid") TO "authenticated";
-GRANT ALL ON FUNCTION "public"."aggregate_invoices"("p_f_text" "text", "p_f_client" "uuid", "p_f_from" "date", "p_f_to" "date", "p_f_vat" "text", "p_f_project" "uuid") TO "service_role";
+REVOKE ALL ON FUNCTION "public"."aggregate_invoices"("p_f_text" "text", "p_f_client" "uuid", "p_f_from" "date", "p_f_to" "date", "p_f_vat" "text", "p_f_project" "text") FROM PUBLIC;
+GRANT ALL ON FUNCTION "public"."aggregate_invoices"("p_f_text" "text", "p_f_client" "uuid", "p_f_from" "date", "p_f_to" "date", "p_f_vat" "text", "p_f_project" "text") TO "anon";
+GRANT ALL ON FUNCTION "public"."aggregate_invoices"("p_f_text" "text", "p_f_client" "uuid", "p_f_from" "date", "p_f_to" "date", "p_f_vat" "text", "p_f_project" "text") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."aggregate_invoices"("p_f_text" "text", "p_f_client" "uuid", "p_f_from" "date", "p_f_to" "date", "p_f_vat" "text", "p_f_project" "text") TO "service_role";
 
 
 
@@ -12708,9 +12737,10 @@ GRANT ALL ON FUNCTION "public"."list_cost_supplier_statements"("p_company" "text
 
 
 
-REVOKE ALL ON FUNCTION "public"."list_invoices"("p_f_text" "text", "p_f_client" "uuid", "p_f_from" "date", "p_f_to" "date", "p_f_vat" "text", "p_f_project" "uuid", "p_sort_dir" "text", "p_limit" integer, "p_offset" integer) FROM PUBLIC;
-GRANT ALL ON FUNCTION "public"."list_invoices"("p_f_text" "text", "p_f_client" "uuid", "p_f_from" "date", "p_f_to" "date", "p_f_vat" "text", "p_f_project" "uuid", "p_sort_dir" "text", "p_limit" integer, "p_offset" integer) TO "authenticated";
-GRANT ALL ON FUNCTION "public"."list_invoices"("p_f_text" "text", "p_f_client" "uuid", "p_f_from" "date", "p_f_to" "date", "p_f_vat" "text", "p_f_project" "uuid", "p_sort_dir" "text", "p_limit" integer, "p_offset" integer) TO "service_role";
+REVOKE ALL ON FUNCTION "public"."list_invoices"("p_f_text" "text", "p_f_client" "uuid", "p_f_from" "date", "p_f_to" "date", "p_f_vat" "text", "p_f_project" "text", "p_sort_dir" "text", "p_limit" integer, "p_offset" integer) FROM PUBLIC;
+GRANT ALL ON FUNCTION "public"."list_invoices"("p_f_text" "text", "p_f_client" "uuid", "p_f_from" "date", "p_f_to" "date", "p_f_vat" "text", "p_f_project" "text", "p_sort_dir" "text", "p_limit" integer, "p_offset" integer) TO "anon";
+GRANT ALL ON FUNCTION "public"."list_invoices"("p_f_text" "text", "p_f_client" "uuid", "p_f_from" "date", "p_f_to" "date", "p_f_vat" "text", "p_f_project" "text", "p_sort_dir" "text", "p_limit" integer, "p_offset" integer) TO "authenticated";
+GRANT ALL ON FUNCTION "public"."list_invoices"("p_f_text" "text", "p_f_client" "uuid", "p_f_from" "date", "p_f_to" "date", "p_f_vat" "text", "p_f_project" "text", "p_sort_dir" "text", "p_limit" integer, "p_offset" integer) TO "service_role";
 
 
 
@@ -12789,10 +12819,17 @@ GRANT ALL ON FUNCTION "public"."normalize_vat_number"("p_vat" "text") TO "servic
 
 
 
-REVOKE ALL ON FUNCTION "public"."outgoing_invoice_passes_filters"("p_inv" "public"."invoices", "p_f_text" "text", "p_f_client" "uuid", "p_f_from" "date", "p_f_to" "date", "p_f_vat" "text", "p_f_project" "uuid") FROM PUBLIC;
-GRANT ALL ON FUNCTION "public"."outgoing_invoice_passes_filters"("p_inv" "public"."invoices", "p_f_text" "text", "p_f_client" "uuid", "p_f_from" "date", "p_f_to" "date", "p_f_vat" "text", "p_f_project" "uuid") TO "anon";
-GRANT ALL ON FUNCTION "public"."outgoing_invoice_passes_filters"("p_inv" "public"."invoices", "p_f_text" "text", "p_f_client" "uuid", "p_f_from" "date", "p_f_to" "date", "p_f_vat" "text", "p_f_project" "uuid") TO "authenticated";
-GRANT ALL ON FUNCTION "public"."outgoing_invoice_passes_filters"("p_inv" "public"."invoices", "p_f_text" "text", "p_f_client" "uuid", "p_f_from" "date", "p_f_to" "date", "p_f_vat" "text", "p_f_project" "uuid") TO "service_role";
+REVOKE ALL ON FUNCTION "public"."outgoing_invoice_line_matches_project"("p_line_project_id" "uuid", "p_line_is_overhead" boolean, "p_f_project" "text") FROM PUBLIC;
+GRANT ALL ON FUNCTION "public"."outgoing_invoice_line_matches_project"("p_line_project_id" "uuid", "p_line_is_overhead" boolean, "p_f_project" "text") TO "anon";
+GRANT ALL ON FUNCTION "public"."outgoing_invoice_line_matches_project"("p_line_project_id" "uuid", "p_line_is_overhead" boolean, "p_f_project" "text") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."outgoing_invoice_line_matches_project"("p_line_project_id" "uuid", "p_line_is_overhead" boolean, "p_f_project" "text") TO "service_role";
+
+
+
+REVOKE ALL ON FUNCTION "public"."outgoing_invoice_passes_filters"("p_inv" "public"."invoices", "p_f_text" "text", "p_f_client" "uuid", "p_f_from" "date", "p_f_to" "date", "p_f_vat" "text", "p_f_project" "text") FROM PUBLIC;
+GRANT ALL ON FUNCTION "public"."outgoing_invoice_passes_filters"("p_inv" "public"."invoices", "p_f_text" "text", "p_f_client" "uuid", "p_f_from" "date", "p_f_to" "date", "p_f_vat" "text", "p_f_project" "text") TO "anon";
+GRANT ALL ON FUNCTION "public"."outgoing_invoice_passes_filters"("p_inv" "public"."invoices", "p_f_text" "text", "p_f_client" "uuid", "p_f_from" "date", "p_f_to" "date", "p_f_vat" "text", "p_f_project" "text") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."outgoing_invoice_passes_filters"("p_inv" "public"."invoices", "p_f_text" "text", "p_f_client" "uuid", "p_f_from" "date", "p_f_to" "date", "p_f_vat" "text", "p_f_project" "text") TO "service_role";
 
 
 
