@@ -2769,6 +2769,22 @@ $$;
 ALTER FUNCTION "public"."cost_invoice_matches_company_filter"("p_ci" "public"."cost_invoices", "p_f_company" "text") OWNER TO "postgres";
 
 
+CREATE OR REPLACE FUNCTION "public"."cost_invoice_matches_outgoing_invoice"("p_invoice_number" "text") RETURNS boolean
+    LANGUAGE "sql" STABLE
+    SET "search_path" TO 'public'
+    AS $_$
+  SELECT EXISTS (
+    SELECT 1
+    FROM public.invoices o
+    WHERE btrim(coalesce(p_invoice_number, '')) ~ '^[0-9]+$'
+      AND o.invoice_number::text = btrim(p_invoice_number)
+  );
+$_$;
+
+
+ALTER FUNCTION "public"."cost_invoice_matches_outgoing_invoice"("p_invoice_number" "text") OWNER TO "postgres";
+
+
 CREATE OR REPLACE FUNCTION "public"."cost_invoice_matches_project"("p_invoice" "public"."cost_invoices", "p_split_project_id" "uuid", "p_split_project_other" "text", "p_split_is_overhead" boolean, "p_f_project" "text") RETURNS boolean
     LANGUAGE "sql" IMMUTABLE
     SET "search_path" TO 'public'
@@ -2829,7 +2845,8 @@ CREATE OR REPLACE FUNCTION "public"."cost_invoice_passes_filters"("p_ci" "public
     SET "search_path" TO 'public'
     AS $$
   SELECT
-    (NOT p_dup_only OR p_ci.is_duplicate OR p_ci.has_duplicate_siblings)
+    NOT public.cost_invoice_matches_outgoing_invoice(p_ci.invoice_number)
+    AND (NOT p_dup_only OR p_ci.is_duplicate OR p_ci.has_duplicate_siblings)
     AND (NOT p_amount_conflict_only OR p_ci.has_amount_conflict)
     AND (NOT p_missing_due_date OR p_ci.due_date IS NULL)
     AND (
@@ -12412,6 +12429,13 @@ GRANT ALL ON FUNCTION "public"."cost_invoice_invoice_project_label"("p_project_i
 GRANT ALL ON FUNCTION "public"."cost_invoice_matches_company_filter"("p_ci" "public"."cost_invoices", "p_f_company" "text") TO "anon";
 GRANT ALL ON FUNCTION "public"."cost_invoice_matches_company_filter"("p_ci" "public"."cost_invoices", "p_f_company" "text") TO "authenticated";
 GRANT ALL ON FUNCTION "public"."cost_invoice_matches_company_filter"("p_ci" "public"."cost_invoices", "p_f_company" "text") TO "service_role";
+
+
+
+REVOKE ALL ON FUNCTION "public"."cost_invoice_matches_outgoing_invoice"("p_invoice_number" "text") FROM PUBLIC;
+GRANT ALL ON FUNCTION "public"."cost_invoice_matches_outgoing_invoice"("p_invoice_number" "text") TO "anon";
+GRANT ALL ON FUNCTION "public"."cost_invoice_matches_outgoing_invoice"("p_invoice_number" "text") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."cost_invoice_matches_outgoing_invoice"("p_invoice_number" "text") TO "service_role";
 
 
 
