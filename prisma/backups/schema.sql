@@ -8338,11 +8338,21 @@ CREATE TABLE IF NOT EXISTS "public"."plant" (
     "serial_no" "text",
     "next_service_due" "date",
     "active" boolean DEFAULT true NOT NULL,
-    "created_at" timestamp with time zone DEFAULT "now"() NOT NULL
+    "created_at" timestamp with time zone DEFAULT "now"() NOT NULL,
+    "archived_at" timestamp with time zone,
+    "archived_by" "uuid"
 );
 
 
 ALTER TABLE "public"."plant" OWNER TO "postgres";
+
+
+COMMENT ON COLUMN "public"."plant"."archived_at" IS 'When set, the plant item is archived (hidden from active lists and forms; history retained).';
+
+
+
+COMMENT ON COLUMN "public"."plant"."archived_by" IS 'Profile id of the admin who archived this plant item.';
+
 
 
 CREATE TABLE IF NOT EXISTS "public"."plant_inspection_items" (
@@ -8907,11 +8917,21 @@ CREATE TABLE IF NOT EXISTS "public"."vehicles" (
     "mot_due_date" "date",
     "tax_due_date" "date",
     "mot_reminded_at" timestamp with time zone,
-    "tax_reminded_at" timestamp with time zone
+    "tax_reminded_at" timestamp with time zone,
+    "archived_at" timestamp with time zone,
+    "archived_by" "uuid"
 );
 
 
 ALTER TABLE "public"."vehicles" OWNER TO "postgres";
+
+
+COMMENT ON COLUMN "public"."vehicles"."archived_at" IS 'When set, the vehicle is archived (hidden from active lists and forms; history retained).';
+
+
+
+COMMENT ON COLUMN "public"."vehicles"."archived_by" IS 'Profile id of the admin who archived this vehicle.';
+
 
 
 CREATE TABLE IF NOT EXISTS "public"."website_contact_email_account" (
@@ -9689,6 +9709,10 @@ CREATE INDEX "password_recovery_tokens_user_idx" ON "public"."password_recovery_
 
 
 
+CREATE INDEX "plant_archived_at_idx" ON "public"."plant" USING "btree" ("archived_at") WHERE ("archived_at" IS NOT NULL);
+
+
+
 CREATE INDEX "plant_inspections_project_id_idx" ON "public"."plant_inspections" USING "btree" ("project_id");
 
 
@@ -9826,6 +9850,10 @@ CREATE INDEX "vehicle_defects_worker_id_inspection_date_idx" ON "public"."vehicl
 
 
 CREATE INDEX "vehicle_service_records_vehicle_id_idx" ON "public"."vehicle_service_records" USING "btree" ("vehicle_id", "service_date" DESC);
+
+
+
+CREATE INDEX "vehicles_archived_at_idx" ON "public"."vehicles" USING "btree" ("archived_at") WHERE ("archived_at" IS NOT NULL);
 
 
 
@@ -10344,6 +10372,11 @@ ALTER TABLE ONLY "public"."password_recovery_tokens"
 
 
 
+ALTER TABLE ONLY "public"."plant"
+    ADD CONSTRAINT "plant_archived_by_fkey" FOREIGN KEY ("archived_by") REFERENCES "public"."profiles"("id") ON DELETE SET NULL;
+
+
+
 ALTER TABLE ONLY "public"."plant_inspection_items"
     ADD CONSTRAINT "plant_inspection_items_inspection_id_fkey" FOREIGN KEY ("inspection_id") REFERENCES "public"."plant_inspections"("id") ON DELETE CASCADE;
 
@@ -10721,6 +10754,11 @@ ALTER TABLE ONLY "public"."vehicle_service_records"
 
 ALTER TABLE ONLY "public"."vehicle_service_records"
     ADD CONSTRAINT "vehicle_service_records_vehicle_id_fkey" FOREIGN KEY ("vehicle_id") REFERENCES "public"."vehicles"("id") ON DELETE CASCADE;
+
+
+
+ALTER TABLE ONLY "public"."vehicles"
+    ADD CONSTRAINT "vehicles_archived_by_fkey" FOREIGN KEY ("archived_by") REFERENCES "public"."profiles"("id") ON DELETE SET NULL;
 
 
 
@@ -11210,7 +11248,15 @@ CREATE POLICY "pi_items read" ON "public"."plant_inspection_items" FOR SELECT TO
 ALTER TABLE "public"."plant" ENABLE ROW LEVEL SECURITY;
 
 
-CREATE POLICY "plant admin write" ON "public"."plant" TO "authenticated" USING ("public"."has_permission"("auth"."uid"(), 'access.admin'::"text", false)) WITH CHECK ("public"."has_permission"("auth"."uid"(), 'access.admin'::"text", false));
+CREATE POLICY "plant admin delete" ON "public"."plant" FOR DELETE TO "authenticated" USING ("public"."has_full_admin"("auth"."uid"()));
+
+
+
+CREATE POLICY "plant admin insert" ON "public"."plant" FOR INSERT TO "authenticated" WITH CHECK ("public"."has_permission"("auth"."uid"(), 'access.admin'::"text", false));
+
+
+
+CREATE POLICY "plant admin update" ON "public"."plant" FOR UPDATE TO "authenticated" USING ("public"."has_permission"("auth"."uid"(), 'access.admin'::"text", false)) WITH CHECK ("public"."has_permission"("auth"."uid"(), 'access.admin'::"text", false));
 
 
 
@@ -11682,11 +11728,19 @@ CREATE POLICY "vd_items read" ON "public"."vehicle_defect_items" FOR SELECT TO "
 
 
 
-CREATE POLICY "vehicle assignments admin write" ON "public"."vehicle_assignments" TO "authenticated" USING ("public"."has_role_app_role_deprecated"("auth"."uid"(), 'admin'::"public"."app_role")) WITH CHECK ("public"."has_role_app_role_deprecated"("auth"."uid"(), 'admin'::"public"."app_role"));
+CREATE POLICY "vehicle assignments admin delete" ON "public"."vehicle_assignments" FOR DELETE TO "authenticated" USING ("public"."has_permission"("auth"."uid"(), 'access.admin'::"text", false));
 
 
 
-CREATE POLICY "vehicle assignments read" ON "public"."vehicle_assignments" FOR SELECT TO "authenticated" USING ((("user_id" = "auth"."uid"()) OR "public"."has_role_app_role_deprecated"("auth"."uid"(), 'admin'::"public"."app_role")));
+CREATE POLICY "vehicle assignments admin insert" ON "public"."vehicle_assignments" FOR INSERT TO "authenticated" WITH CHECK ("public"."has_permission"("auth"."uid"(), 'access.admin'::"text", false));
+
+
+
+CREATE POLICY "vehicle assignments admin update" ON "public"."vehicle_assignments" FOR UPDATE TO "authenticated" USING ("public"."has_permission"("auth"."uid"(), 'access.admin'::"text", false)) WITH CHECK ("public"."has_permission"("auth"."uid"(), 'access.admin'::"text", false));
+
+
+
+CREATE POLICY "vehicle assignments read" ON "public"."vehicle_assignments" FOR SELECT TO "authenticated" USING ((("user_id" = "auth"."uid"()) OR "public"."has_permission"("auth"."uid"(), 'access.admin'::"text", false)));
 
 
 
@@ -11713,7 +11767,15 @@ CREATE POLICY "vehicle_service_records read authed" ON "public"."vehicle_service
 ALTER TABLE "public"."vehicles" ENABLE ROW LEVEL SECURITY;
 
 
-CREATE POLICY "vehicles admin write" ON "public"."vehicles" TO "authenticated" USING ("public"."has_permission"("auth"."uid"(), 'access.admin'::"text", false)) WITH CHECK ("public"."has_permission"("auth"."uid"(), 'access.admin'::"text", false));
+CREATE POLICY "vehicles admin delete" ON "public"."vehicles" FOR DELETE TO "authenticated" USING ("public"."has_full_admin"("auth"."uid"()));
+
+
+
+CREATE POLICY "vehicles admin insert" ON "public"."vehicles" FOR INSERT TO "authenticated" WITH CHECK ("public"."has_permission"("auth"."uid"(), 'access.admin'::"text", false));
+
+
+
+CREATE POLICY "vehicles admin update" ON "public"."vehicles" FOR UPDATE TO "authenticated" USING ("public"."has_permission"("auth"."uid"(), 'access.admin'::"text", false)) WITH CHECK ("public"."has_permission"("auth"."uid"(), 'access.admin'::"text", false));
 
 
 
