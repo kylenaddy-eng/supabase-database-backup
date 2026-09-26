@@ -4572,37 +4572,170 @@ ALTER FUNCTION "public"."list_cost_invoices"("p_f_text" "text", "p_f_description
 CREATE OR REPLACE FUNCTION "public"."list_cost_payment_remittances"("p_company" "text" DEFAULT ''::"text", "p_paid_from" "date" DEFAULT NULL::"date", "p_paid_to" "date" DEFAULT NULL::"date", "p_limit" integer DEFAULT 20, "p_offset" integer DEFAULT 0) RETURNS TABLE("id" "uuid", "company_name" "text", "paid_at" timestamp with time zone, "nas_path" "text", "total_net" numeric, "total_vat" numeric, "total_amount" numeric, "invoice_count" integer, "lines" "jsonb", "created_at" timestamp with time zone, "total_count" bigint)
     LANGUAGE "sql" STABLE SECURITY DEFINER
     SET "search_path" TO 'public'
-    AS $$
-  WITH auth_guard AS (SELECT public.assert_rpc_admin() AS _), filtered AS (
-    SELECT r.*
+    AS $_$
+  WITH auth_guard AS (
+    SELECT public.assert_rpc_costs() AS _
+  ),
+  caller AS (
+    SELECT
+      auth.role() = 'service_role'
+      OR public.has_permission(auth.uid(), 'costs.view_confidential', false) AS can_view_confidential
+  ),
+  expanded AS (
+    SELECT
+      r.id,
+      r.company_name,
+      r.paid_at,
+      r.nas_path,
+      r.total_net,
+      r.total_vat,
+      r.total_amount,
+      r.invoice_count,
+      r.created_at,
+      elem.line,
+      elem.line_ord,
+      CASE
+        WHEN (elem.line->>'invoice_id') ~* '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
+        THEN (elem.line->>'invoice_id')::uuid
+        ELSE NULL
+      END AS invoice_id
     FROM public.cost_payment_remittances r
     CROSS JOIN auth_guard
+    LEFT JOIN LATERAL jsonb_array_elements(
+      CASE
+        WHEN jsonb_typeof(r.lines) = 'array' THEN r.lines
+        ELSE '[]'::jsonb
+      END
+    ) WITH ORDINALITY AS elem(line, line_ord) ON true
     WHERE
       (coalesce(nullif(trim(p_company), ''), NULL) IS NULL OR r.company_name = trim(p_company))
       AND (p_paid_from IS NULL OR r.paid_at::date >= p_paid_from)
       AND (p_paid_to IS NULL OR r.paid_at::date <= p_paid_to)
   ),
+  classified AS (
+    SELECT
+      e.*,
+      EXISTS (
+        SELECT 1
+        FROM public.cost_invoices ci
+        WHERE ci.id = e.invoice_id
+          AND ci.is_confidential
+          AND NOT c.can_view_confidential
+      ) AS hidden
+    FROM expanded e
+    CROSS JOIN caller c
+  ),
+  grouped AS (
+    SELECT
+      c.id,
+      c.company_name,
+      c.paid_at,
+      c.created_at,
+      bool_or(c.hidden) AS any_hidden,
+      count(*) FILTER (WHERE c.line IS NOT NULL) AS original_count,
+      count(*) FILTER (WHERE c.line IS NOT NULL AND NOT c.hidden) AS visible_count,
+      CASE
+        WHEN bool_or(c.hidden) THEN NULL
+        ELSE max(c.nas_path)
+      END AS nas_path,
+      coalesce(
+        jsonb_agg(c.line ORDER BY c.line_ord) FILTER (WHERE c.line IS NOT NULL AND NOT c.hidden),
+        '[]'::jsonb
+      ) AS lines,
+      max(c.total_net) AS stored_total_net,
+      max(c.total_vat) AS stored_total_vat,
+      max(c.total_amount) AS stored_total_amount,
+      max(c.invoice_count) AS stored_invoice_count
+    FROM classified c
+    GROUP BY c.id, c.company_name, c.paid_at, c.created_at
+  ),
+  visible AS (
+    SELECT g.*
+    FROM grouped g
+    WHERE g.original_count = 0 OR g.visible_count > 0
+  ),
+  shaped AS (
+    SELECT
+      v.id,
+      v.company_name,
+      v.paid_at,
+      v.nas_path,
+      CASE
+        WHEN v.any_hidden THEN (
+          SELECT coalesce(sum(
+            CASE
+              WHEN (l->>'net_amount') ~ '^-?[0-9]+(\.[0-9]+)?$' THEN (l->>'net_amount')::numeric
+              ELSE 0
+            END
+          ), 0)
+          FROM jsonb_array_elements(v.lines) l
+        )
+        ELSE v.stored_total_net
+      END AS total_net,
+      CASE
+        WHEN v.any_hidden THEN (
+          SELECT coalesce(sum(
+            CASE
+              WHEN (l->>'vat_amount') ~ '^-?[0-9]+(\.[0-9]+)?$' THEN (l->>'vat_amount')::numeric
+              ELSE 0
+            END
+          ), 0)
+          FROM jsonb_array_elements(v.lines) l
+        )
+        ELSE v.stored_total_vat
+      END AS total_vat,
+      CASE
+        WHEN v.any_hidden THEN (
+          SELECT coalesce(sum(
+            CASE
+              WHEN (l->>'total_amount') ~ '^-?[0-9]+(\.[0-9]+)?$'
+                AND (l->>'total_amount')::numeric <> 0
+              THEN (l->>'total_amount')::numeric
+              ELSE
+                CASE
+                  WHEN (l->>'net_amount') ~ '^-?[0-9]+(\.[0-9]+)?$' THEN (l->>'net_amount')::numeric
+                  ELSE 0
+                END
+                +
+                CASE
+                  WHEN (l->>'vat_amount') ~ '^-?[0-9]+(\.[0-9]+)?$' THEN (l->>'vat_amount')::numeric
+                  ELSE 0
+                END
+            END
+          ), 0)
+          FROM jsonb_array_elements(v.lines) l
+        )
+        ELSE v.stored_total_amount
+      END AS total_amount,
+      CASE
+        WHEN v.any_hidden THEN v.visible_count::integer
+        ELSE v.stored_invoice_count
+      END AS invoice_count,
+      v.lines,
+      v.created_at
+    FROM visible v
+  ),
   counted AS (
-    SELECT count(*)::bigint AS cnt FROM filtered
+    SELECT count(*)::bigint AS cnt FROM shaped
   )
   SELECT
-    f.id,
-    f.company_name,
-    f.paid_at,
-    f.nas_path,
-    f.total_net,
-    f.total_vat,
-    f.total_amount,
-    f.invoice_count,
-    f.lines,
-    f.created_at,
+    s.id,
+    s.company_name,
+    s.paid_at,
+    s.nas_path,
+    s.total_net,
+    s.total_vat,
+    s.total_amount,
+    s.invoice_count,
+    s.lines,
+    s.created_at,
     c.cnt AS total_count
-  FROM filtered f
+  FROM shaped s
   CROSS JOIN counted c
-  ORDER BY f.paid_at DESC, f.id DESC
+  ORDER BY s.paid_at DESC, s.id DESC
   LIMIT greatest(coalesce(p_limit, 20), 0)
   OFFSET greatest(coalesce(p_offset, 0), 0);
-$$;
+$_$;
 
 
 ALTER FUNCTION "public"."list_cost_payment_remittances"("p_company" "text", "p_paid_from" "date", "p_paid_to" "date", "p_limit" integer, "p_offset" integer) OWNER TO "postgres";
@@ -10786,7 +10919,18 @@ CREATE POLICY "Admins delete cost invoices" ON "public"."cost_invoices" FOR DELE
 
 
 
-CREATE POLICY "Admins delete cost payment remittances" ON "public"."cost_payment_remittances" FOR DELETE TO "authenticated" USING ("public"."has_permission"("auth"."uid"(), 'access.costs'::"text", false));
+CREATE POLICY "Admins delete cost payment remittances" ON "public"."cost_payment_remittances" FOR DELETE TO "authenticated" USING (("public"."has_permission"("auth"."uid"(), 'access.costs'::"text", false) AND ("public"."has_permission"("auth"."uid"(), 'costs.view_confidential'::"text", false) OR (NOT (EXISTS ( SELECT 1
+   FROM ("jsonb_array_elements"(
+        CASE
+            WHEN ("jsonb_typeof"("cost_payment_remittances"."lines") = 'array'::"text") THEN "cost_payment_remittances"."lines"
+            ELSE '[]'::"jsonb"
+        END) "elem"("value")
+     JOIN "public"."cost_invoices" "ci" ON (("ci"."id" =
+        CASE
+            WHEN (("elem"."value" ->> 'invoice_id'::"text") ~* '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'::"text") THEN (("elem"."value" ->> 'invoice_id'::"text"))::"uuid"
+            ELSE NULL::"uuid"
+        END)))
+  WHERE "ci"."is_confidential"))))));
 
 
 
@@ -10818,7 +10962,18 @@ CREATE POLICY "Admins read cost invoices" ON "public"."cost_invoices" FOR SELECT
 
 
 
-CREATE POLICY "Admins read cost payment remittances" ON "public"."cost_payment_remittances" FOR SELECT TO "authenticated" USING ("public"."has_permission"("auth"."uid"(), 'access.costs'::"text", false));
+CREATE POLICY "Admins read cost payment remittances" ON "public"."cost_payment_remittances" FOR SELECT TO "authenticated" USING (("public"."has_permission"("auth"."uid"(), 'access.costs'::"text", false) AND ("public"."has_permission"("auth"."uid"(), 'costs.view_confidential'::"text", false) OR (NOT (EXISTS ( SELECT 1
+   FROM ("jsonb_array_elements"(
+        CASE
+            WHEN ("jsonb_typeof"("cost_payment_remittances"."lines") = 'array'::"text") THEN "cost_payment_remittances"."lines"
+            ELSE '[]'::"jsonb"
+        END) "elem"("value")
+     JOIN "public"."cost_invoices" "ci" ON (("ci"."id" =
+        CASE
+            WHEN (("elem"."value" ->> 'invoice_id'::"text") ~* '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'::"text") THEN (("elem"."value" ->> 'invoice_id'::"text"))::"uuid"
+            ELSE NULL::"uuid"
+        END)))
+  WHERE "ci"."is_confidential"))))));
 
 
 
