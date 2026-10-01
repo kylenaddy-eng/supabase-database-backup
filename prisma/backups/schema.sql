@@ -844,6 +844,25 @@ $$;
 ALTER FUNCTION "public"."aggregate_invoices"("p_f_text" "text", "p_f_client" "uuid", "p_f_from" "date", "p_f_to" "date", "p_f_vat" "text", "p_f_project" "text") OWNER TO "postgres";
 
 
+CREATE OR REPLACE FUNCTION "public"."assert_cost_company_name_editor"() RETURNS "void"
+    LANGUAGE "plpgsql" SECURITY DEFINER
+    SET "search_path" TO 'public'
+    AS $$
+BEGIN
+  PERFORM public.assert_rpc_costs();
+  IF coalesce(auth.role(), '') = 'service_role' THEN
+    RETURN;
+  END IF;
+  IF auth.uid() IS NULL OR NOT public.has_role(auth.uid(), 'super_admin') THEN
+    RAISE EXCEPTION 'Forbidden';
+  END IF;
+END;
+$$;
+
+
+ALTER FUNCTION "public"."assert_cost_company_name_editor"() OWNER TO "postgres";
+
+
 CREATE OR REPLACE FUNCTION "public"."assert_rpc_admin"() RETURNS boolean
     LANGUAGE "plpgsql" SECURITY DEFINER
     SET "search_path" TO 'public'
@@ -2606,7 +2625,16 @@ CREATE TABLE IF NOT EXISTS "public"."cost_invoices" (
     "vehicle_id" "uuid",
     "vehicle_registration_extracted" "text",
     "vehicle_service_nas_path" "text",
-    CONSTRAINT "cost_invoices_document_type_check" CHECK (("document_type" = ANY (ARRAY['invoice'::"text", 'credit_note'::"text", 'pro_forma'::"text"])))
+    "overhead_spread_months" smallint,
+    "allocation_month" "date",
+    "company_name_manual" boolean DEFAULT false NOT NULL,
+    "is_vehicle_purchase" boolean DEFAULT false NOT NULL,
+    "vehicle_monthly_cost" numeric(12,2),
+    "vehicle_is_financed" boolean DEFAULT false NOT NULL,
+    CONSTRAINT "cost_invoices_document_type_check" CHECK (("document_type" = ANY (ARRAY['invoice'::"text", 'credit_note'::"text", 'pro_forma'::"text"]))),
+    CONSTRAINT "cost_invoices_overhead_spread_months_check" CHECK ((("overhead_spread_months" IS NULL) OR ("overhead_spread_months" = ANY (ARRAY[12, 24, 36, 48, 60])))),
+    CONSTRAINT "cost_invoices_vehicle_monthly_cost_nonnegative" CHECK ((("vehicle_monthly_cost" IS NULL) OR ("vehicle_monthly_cost" >= (0)::numeric))),
+    CONSTRAINT "cost_invoices_vehicle_purchase_not_service" CHECK (((NOT ("is_vehicle_purchase" AND "is_vehicle_service")) AND ((NOT "is_vehicle_purchase") OR ("vehicle_id" IS NOT NULL))))
 );
 
 
@@ -2630,6 +2658,18 @@ COMMENT ON COLUMN "public"."cost_invoices"."is_vehicle_service" IS 'When true, a
 
 
 COMMENT ON COLUMN "public"."cost_invoices"."vehicle_service_nas_path" IS 'Duplicate NAS path under Vehicle Service Records/<registration>/ when is_vehicle_service is true.';
+
+
+
+COMMENT ON COLUMN "public"."cost_invoices"."overhead_spread_months" IS 'When set, overhead net is recovered in equal slices over this many months starting at allocation_month or invoice_date.';
+
+
+
+COMMENT ON COLUMN "public"."cost_invoices"."allocation_month" IS 'Optional month the cost counts in. Blank uses the invoice date.';
+
+
+
+COMMENT ON COLUMN "public"."cost_invoices"."company_name_manual" IS 'When true, company_name is a one-off override and is not rewritten to the canonical supplier name.';
 
 
 
@@ -3100,6 +3140,19 @@ DECLARE
 BEGIN
   NEW.supplier_email_domain := public.trusted_supplier_email_domain(NEW.source_email_from);
   NEW.invoice_format_key := public.invoice_format_key(NEW.invoice_number);
+
+  IF current_setting('app.cost_invoice_company_override', true) = '1' THEN
+    NEW.company_name_manual := true;
+    RETURN NEW;
+  END IF;
+
+  IF TG_OP = 'UPDATE' THEN
+    IF COALESCE(OLD.company_name_manual, false) THEN
+      NEW.company_name := OLD.company_name;
+      NEW.company_name_manual := true;
+      RETURN NEW;
+    END IF;
+  END IF;
 
   IF NEW.company_name IS NOT NULL
      AND btrim(NEW.company_name) <> ''
@@ -3908,11 +3961,16 @@ CREATE TABLE IF NOT EXISTS "public"."invoices" (
     "created_at" timestamp with time zone DEFAULT "now"() NOT NULL,
     "updated_at" timestamp with time zone DEFAULT "now"() NOT NULL,
     "search_document" "tsvector",
-    "show_qty_unit_rate" boolean DEFAULT false NOT NULL
+    "show_qty_unit_rate" boolean DEFAULT false NOT NULL,
+    "allocation_month" "date"
 );
 
 
 ALTER TABLE "public"."invoices" OWNER TO "postgres";
+
+
+COMMENT ON COLUMN "public"."invoices"."allocation_month" IS 'Optional month this sales invoice counts in for the cost report. Blank uses the invoice date.';
+
 
 
 CREATE OR REPLACE FUNCTION "public"."invoice_build_search_document"("p_row" "public"."invoices") RETURNS "tsvector"
@@ -6601,6 +6659,100 @@ $$;
 ALTER FUNCTION "public"."refresh_cost_invoice_monthly_rollups"() OWNER TO "postgres";
 
 
+CREATE OR REPLACE FUNCTION "public"."rename_cost_company_display"("p_from" "text", "p_to" "text") RETURNS "jsonb"
+    LANGUAGE "plpgsql" SECURITY DEFINER
+    SET "search_path" TO 'public'
+    AS $$
+DECLARE
+  v_from text;
+  v_to text;
+  v_from_key text;
+  v_to_key text;
+  v_count int;
+BEGIN
+  PERFORM public.assert_cost_company_name_editor();
+
+  v_from := btrim(coalesce(p_from, ''));
+  v_to := btrim(coalesce(p_to, ''));
+
+  IF v_from = '' OR upper(v_from) = 'NA' THEN
+    RAISE EXCEPTION 'Company name is required';
+  END IF;
+  IF v_to = '' OR upper(v_to) = 'NA' THEN
+    RAISE EXCEPTION 'New company name is required';
+  END IF;
+  IF v_from = v_to THEN
+    RETURN jsonb_build_object('from', v_from, 'to', v_to, 'aliases', 0);
+  END IF;
+
+  v_from_key := public.company_match_key(v_from);
+  v_to_key := public.company_match_key(v_to);
+  IF v_from_key IS NULL OR v_from_key = '' OR v_to_key IS NULL OR v_to_key = '' THEN
+    RAISE EXCEPTION 'New company name is not a usable company name';
+  END IF;
+
+  IF EXISTS (
+    SELECT 1
+      FROM public.cost_company_aliases a
+     WHERE a.match_key = v_to_key
+       AND a.match_key IS DISTINCT FROM v_from_key
+       AND btrim(a.canonical_name) IS DISTINCT FROM v_from
+  ) THEN
+    RAISE EXCEPTION 'That name is already used by another company';
+  END IF;
+
+  IF EXISTS (
+    SELECT 1
+      FROM public.cost_company_aliases a
+     WHERE btrim(a.canonical_name) = v_to
+       AND a.match_key IS DISTINCT FROM v_from_key
+       AND btrim(a.canonical_name) IS DISTINCT FROM v_from
+  ) THEN
+    RAISE EXCEPTION 'That name is already used by another company';
+  END IF;
+
+  UPDATE public.cost_company_aliases a
+     SET nas_name = coalesce(nullif(btrim(a.nas_name), ''), a.canonical_name),
+         canonical_name = v_to,
+         updated_at = now()
+   WHERE btrim(a.canonical_name) = v_from
+      OR a.match_key = v_from_key;
+  GET DIAGNOSTICS v_count = ROW_COUNT;
+
+  IF v_count = 0 THEN
+    INSERT INTO public.cost_company_aliases (match_key, canonical_name, nas_name)
+    VALUES (v_from_key, v_to, v_from)
+    ON CONFLICT (match_key) DO UPDATE
+      SET nas_name = coalesce(nullif(btrim(public.cost_company_aliases.nas_name), ''), EXCLUDED.nas_name),
+          canonical_name = EXCLUDED.canonical_name,
+          updated_at = now();
+    v_count := 1;
+  END IF;
+
+  IF v_to_key IS DISTINCT FROM v_from_key THEN
+    INSERT INTO public.cost_company_aliases (match_key, canonical_name)
+    VALUES (v_to_key, v_to)
+    ON CONFLICT (match_key) DO UPDATE
+      SET canonical_name = EXCLUDED.canonical_name,
+          updated_at = now()
+    WHERE public.cost_company_aliases.match_key = v_from_key
+       OR btrim(public.cost_company_aliases.canonical_name) IN (v_from, v_to);
+  END IF;
+
+  INSERT INTO public.cost_company_subcontractors (canonical_company, subcontractor_id)
+  SELECT v_to, s.subcontractor_id
+    FROM public.cost_company_subcontractors s
+   WHERE s.canonical_company = v_from
+  ON CONFLICT (canonical_company) DO NOTHING;
+
+  RETURN jsonb_build_object('from', v_from, 'to', v_to, 'aliases', v_count);
+END;
+$$;
+
+
+ALTER FUNCTION "public"."rename_cost_company_display"("p_from" "text", "p_to" "text") OWNER TO "postgres";
+
+
 CREATE OR REPLACE FUNCTION "public"."resolve_company_from_costs_table"("p_domain" "text", "p_format_key" "text", "p_pdf_name" "text" DEFAULT NULL::"text") RETURNS "text"
     LANGUAGE "plpgsql" STABLE SECURITY DEFINER
     SET "search_path" TO 'public'
@@ -7020,6 +7172,43 @@ $$;
 
 
 ALTER FUNCTION "public"."run_statement_payment_reconcile_backfill_once"() OWNER TO "postgres";
+
+
+CREATE OR REPLACE FUNCTION "public"."set_cost_invoice_company_override"("p_id" "uuid", "p_company_name" "text") RETURNS TABLE("id" "uuid", "company_name" "text")
+    LANGUAGE "plpgsql" SECURITY DEFINER
+    SET "search_path" TO 'public'
+    AS $$
+DECLARE
+  v_name text;
+BEGIN
+  PERFORM public.assert_cost_company_name_editor();
+
+  v_name := nullif(btrim(coalesce(p_company_name, '')), '');
+
+  IF NOT EXISTS (
+    SELECT 1
+      FROM public.cost_invoices ci
+     WHERE ci.id = p_id
+       AND public.cost_invoice_visible_to_caller(ci)
+  ) THEN
+    RAISE EXCEPTION 'Invoice not found';
+  END IF;
+
+  PERFORM set_config('app.cost_invoice_company_override', '1', true);
+
+  RETURN QUERY
+  UPDATE public.cost_invoices ci
+     SET company_name = v_name,
+         company_name_manual = true,
+         updated_at = now()
+   WHERE ci.id = p_id
+     AND public.cost_invoice_visible_to_caller(ci)
+  RETURNING ci.id, ci.company_name;
+END;
+$$;
+
+
+ALTER FUNCTION "public"."set_cost_invoice_company_override"("p_id" "uuid", "p_company_name" "text") OWNER TO "postgres";
 
 
 CREATE OR REPLACE FUNCTION "public"."set_integration_secret"("p_name" "text", "p_value" "text") RETURNS "void"
@@ -7782,11 +7971,16 @@ CREATE TABLE IF NOT EXISTS "public"."cost_company_aliases" (
     "match_key" "text" NOT NULL,
     "canonical_name" "text" NOT NULL,
     "created_at" timestamp with time zone DEFAULT "now"() NOT NULL,
-    "updated_at" timestamp with time zone DEFAULT "now"() NOT NULL
+    "updated_at" timestamp with time zone DEFAULT "now"() NOT NULL,
+    "nas_name" "text"
 );
 
 
 ALTER TABLE "public"."cost_company_aliases" OWNER TO "postgres";
+
+
+COMMENT ON COLUMN "public"."cost_company_aliases"."nas_name" IS 'NAS folder spelling. A future-only display rename keeps the previous folder name here so existing files are not moved.';
+
 
 
 CREATE TABLE IF NOT EXISTS "public"."cost_company_brand_aliases" (
@@ -7879,7 +8073,10 @@ CREATE TABLE IF NOT EXISTS "public"."cost_invoice_splits" (
     "total_amount" numeric(12,2),
     "created_at" timestamp with time zone DEFAULT "now"() NOT NULL,
     "updated_at" timestamp with time zone DEFAULT "now"() NOT NULL,
-    "quantity" numeric
+    "quantity" numeric,
+    "overhead_spread_months" smallint,
+    "allocation_month" "date",
+    CONSTRAINT "cost_invoice_splits_overhead_spread_months_check" CHECK ((("overhead_spread_months" IS NULL) OR ("overhead_spread_months" = ANY (ARRAY[12, 24, 36, 48, 60]))))
 );
 
 
@@ -7901,6 +8098,44 @@ CREATE TABLE IF NOT EXISTS "public"."cost_payment_remittances" (
 
 
 ALTER TABLE "public"."cost_payment_remittances" OWNER TO "postgres";
+
+
+CREATE TABLE IF NOT EXISTS "public"."cost_report_assumptions" (
+    "id" "uuid" DEFAULT "gen_random_uuid"() NOT NULL,
+    "project_id" "uuid" NOT NULL,
+    "amount_net" numeric(12,2) NOT NULL,
+    "allocation_month" "date" NOT NULL,
+    "note" "text",
+    "created_by" "uuid",
+    "created_at" timestamp with time zone DEFAULT "now"() NOT NULL,
+    CONSTRAINT "cost_report_assumptions_amount_nonzero" CHECK (("amount_net" <> (0)::numeric))
+);
+
+
+ALTER TABLE "public"."cost_report_assumptions" OWNER TO "postgres";
+
+
+CREATE TABLE IF NOT EXISTS "public"."cost_report_cost_assumptions" (
+    "id" "uuid" DEFAULT "gen_random_uuid"() NOT NULL,
+    "project_id" "uuid",
+    "amount_net" numeric(12,2) NOT NULL,
+    "allocation_month" "date" NOT NULL,
+    "spread_months" smallint,
+    "is_overhead" boolean DEFAULT false NOT NULL,
+    "note" "text",
+    "created_by" "uuid",
+    "created_at" timestamp with time zone DEFAULT "now"() NOT NULL,
+    CONSTRAINT "cost_report_cost_assumptions_amount_nonzero" CHECK (("amount_net" <> (0)::numeric)),
+    CONSTRAINT "cost_report_cost_assumptions_project_when_direct" CHECK (("is_overhead" OR ("project_id" IS NOT NULL))),
+    CONSTRAINT "cost_report_cost_assumptions_spread_months_check" CHECK ((("spread_months" IS NULL) OR ("spread_months" = ANY (ARRAY[12, 24, 36, 48, 60]))))
+);
+
+
+ALTER TABLE "public"."cost_report_cost_assumptions" OWNER TO "postgres";
+
+
+COMMENT ON TABLE "public"."cost_report_cost_assumptions" IS 'Placeholder costs for cost value reports. Treated like reviewed invoices (direct or overhead with optional spread).';
+
 
 
 CREATE TABLE IF NOT EXISTS "public"."cost_scan_skips" (
@@ -9020,6 +9255,19 @@ CREATE TABLE IF NOT EXISTS "public"."vehicle_defects" (
 ALTER TABLE "public"."vehicle_defects" OWNER TO "postgres";
 
 
+CREATE TABLE IF NOT EXISTS "public"."vehicle_project_days" (
+    "id" "uuid" DEFAULT "gen_random_uuid"() NOT NULL,
+    "vehicle_id" "uuid" NOT NULL,
+    "project_id" "uuid" NOT NULL,
+    "work_date" "date" NOT NULL,
+    "created_by" "uuid",
+    "created_at" timestamp with time zone DEFAULT "now"() NOT NULL
+);
+
+
+ALTER TABLE "public"."vehicle_project_days" OWNER TO "postgres";
+
+
 CREATE TABLE IF NOT EXISTS "public"."vehicle_service_records" (
     "id" "uuid" DEFAULT "gen_random_uuid"() NOT NULL,
     "vehicle_id" "uuid" NOT NULL,
@@ -9154,6 +9402,16 @@ ALTER TABLE ONLY "public"."cost_invoices"
 
 ALTER TABLE ONLY "public"."cost_payment_remittances"
     ADD CONSTRAINT "cost_payment_remittances_pkey" PRIMARY KEY ("id");
+
+
+
+ALTER TABLE ONLY "public"."cost_report_assumptions"
+    ADD CONSTRAINT "cost_report_assumptions_pkey" PRIMARY KEY ("id");
+
+
+
+ALTER TABLE ONLY "public"."cost_report_cost_assumptions"
+    ADD CONSTRAINT "cost_report_cost_assumptions_pkey" PRIMARY KEY ("id");
 
 
 
@@ -9557,6 +9815,16 @@ ALTER TABLE ONLY "public"."vehicle_defects"
 
 
 
+ALTER TABLE ONLY "public"."vehicle_project_days"
+    ADD CONSTRAINT "vehicle_project_days_pkey" PRIMARY KEY ("id");
+
+
+
+ALTER TABLE ONLY "public"."vehicle_project_days"
+    ADD CONSTRAINT "vehicle_project_days_vehicle_id_work_date_key" UNIQUE ("vehicle_id", "work_date");
+
+
+
 ALTER TABLE ONLY "public"."vehicle_service_records"
     ADD CONSTRAINT "vehicle_service_records_cost_invoice_id_key" UNIQUE ("cost_invoice_id");
 
@@ -9654,6 +9922,14 @@ CREATE UNIQUE INDEX "cost_invoices_msgid_unique" ON "public"."cost_invoices" USI
 
 
 
+CREATE UNIQUE INDEX "cost_invoices_one_purchase_per_vehicle" ON "public"."cost_invoices" USING "btree" ("vehicle_id") WHERE ("is_vehicle_purchase" AND ("vehicle_id" IS NOT NULL));
+
+
+
+CREATE INDEX "cost_invoices_overhead_spread_idx" ON "public"."cost_invoices" USING "btree" ("invoice_date") WHERE ("overhead_spread_months" IS NOT NULL);
+
+
+
 CREATE INDEX "cost_invoices_paid_idx" ON "public"."cost_invoices" USING "btree" ("paid_at");
 
 
@@ -9699,6 +9975,14 @@ CREATE INDEX "cost_payment_remittances_company_name_idx" ON "public"."cost_payme
 
 
 CREATE INDEX "cost_payment_remittances_paid_at_idx" ON "public"."cost_payment_remittances" USING "btree" ("paid_at" DESC);
+
+
+
+CREATE INDEX "cost_report_assumptions_month_idx" ON "public"."cost_report_assumptions" USING "btree" ("allocation_month");
+
+
+
+CREATE INDEX "cost_report_cost_assumptions_month_idx" ON "public"."cost_report_cost_assumptions" USING "btree" ("allocation_month");
 
 
 
@@ -9979,6 +10263,10 @@ CREATE INDEX "vehicle_assignments_vehicle_idx" ON "public"."vehicle_assignments"
 
 
 CREATE INDEX "vehicle_defects_worker_id_inspection_date_idx" ON "public"."vehicle_defects" USING "btree" ("worker_id", "inspection_date" DESC);
+
+
+
+CREATE INDEX "vehicle_project_days_vehicle_date_idx" ON "public"."vehicle_project_days" USING "btree" ("vehicle_id", "work_date");
 
 
 
@@ -10357,6 +10645,26 @@ ALTER TABLE ONLY "public"."cost_invoices"
 
 ALTER TABLE ONLY "public"."cost_invoices"
     ADD CONSTRAINT "cost_invoices_vehicle_id_fkey" FOREIGN KEY ("vehicle_id") REFERENCES "public"."vehicles"("id") ON DELETE SET NULL;
+
+
+
+ALTER TABLE ONLY "public"."cost_report_assumptions"
+    ADD CONSTRAINT "cost_report_assumptions_created_by_fkey" FOREIGN KEY ("created_by") REFERENCES "auth"."users"("id") ON DELETE SET NULL;
+
+
+
+ALTER TABLE ONLY "public"."cost_report_assumptions"
+    ADD CONSTRAINT "cost_report_assumptions_project_id_fkey" FOREIGN KEY ("project_id") REFERENCES "public"."projects"("id") ON DELETE CASCADE;
+
+
+
+ALTER TABLE ONLY "public"."cost_report_cost_assumptions"
+    ADD CONSTRAINT "cost_report_cost_assumptions_created_by_fkey" FOREIGN KEY ("created_by") REFERENCES "auth"."users"("id") ON DELETE SET NULL;
+
+
+
+ALTER TABLE ONLY "public"."cost_report_cost_assumptions"
+    ADD CONSTRAINT "cost_report_cost_assumptions_project_id_fkey" FOREIGN KEY ("project_id") REFERENCES "public"."projects"("id") ON DELETE CASCADE;
 
 
 
@@ -10875,6 +11183,21 @@ ALTER TABLE ONLY "public"."vehicle_defects"
 
 
 
+ALTER TABLE ONLY "public"."vehicle_project_days"
+    ADD CONSTRAINT "vehicle_project_days_created_by_fkey" FOREIGN KEY ("created_by") REFERENCES "auth"."users"("id") ON DELETE SET NULL;
+
+
+
+ALTER TABLE ONLY "public"."vehicle_project_days"
+    ADD CONSTRAINT "vehicle_project_days_project_id_fkey" FOREIGN KEY ("project_id") REFERENCES "public"."projects"("id") ON DELETE CASCADE;
+
+
+
+ALTER TABLE ONLY "public"."vehicle_project_days"
+    ADD CONSTRAINT "vehicle_project_days_vehicle_id_fkey" FOREIGN KEY ("vehicle_id") REFERENCES "public"."vehicles"("id") ON DELETE CASCADE;
+
+
+
 ALTER TABLE ONLY "public"."vehicle_service_records"
     ADD CONSTRAINT "vehicle_service_records_cost_invoice_id_fkey" FOREIGN KEY ("cost_invoice_id") REFERENCES "public"."cost_invoices"("id") ON DELETE CASCADE;
 
@@ -11082,6 +11405,14 @@ CREATE POLICY "clients read authed" ON "public"."clients" FOR SELECT TO "authent
 
 
 
+CREATE POLICY "cost report assumptions" ON "public"."cost_report_assumptions" TO "authenticated" USING ("public"."has_permission"("auth"."uid"(), 'access.cost_report'::"text", false)) WITH CHECK ("public"."has_permission"("auth"."uid"(), 'access.cost_report'::"text", false));
+
+
+
+CREATE POLICY "cost report cost assumptions" ON "public"."cost_report_cost_assumptions" TO "authenticated" USING ("public"."has_permission"("auth"."uid"(), 'access.cost_report'::"text", false)) WITH CHECK ("public"."has_permission"("auth"."uid"(), 'access.cost_report'::"text", false));
+
+
+
 ALTER TABLE "public"."cost_company_aliases" ENABLE ROW LEVEL SECURITY;
 
 
@@ -11116,6 +11447,12 @@ ALTER TABLE "public"."cost_invoices" ENABLE ROW LEVEL SECURITY;
 
 
 ALTER TABLE "public"."cost_payment_remittances" ENABLE ROW LEVEL SECURITY;
+
+
+ALTER TABLE "public"."cost_report_assumptions" ENABLE ROW LEVEL SECURITY;
+
+
+ALTER TABLE "public"."cost_report_cost_assumptions" ENABLE ROW LEVEL SECURITY;
 
 
 ALTER TABLE "public"."cost_scan_skips" ENABLE ROW LEVEL SECURITY;
@@ -11899,6 +12236,22 @@ CREATE POLICY "vehicle assignments read" ON "public"."vehicle_assignments" FOR S
 
 
 
+CREATE POLICY "vehicle project days delete" ON "public"."vehicle_project_days" FOR DELETE TO "authenticated" USING ("public"."has_permission"("auth"."uid"(), 'access.admin'::"text", false));
+
+
+
+CREATE POLICY "vehicle project days insert" ON "public"."vehicle_project_days" FOR INSERT TO "authenticated" WITH CHECK ("public"."has_permission"("auth"."uid"(), 'access.admin'::"text", false));
+
+
+
+CREATE POLICY "vehicle project days read" ON "public"."vehicle_project_days" FOR SELECT TO "authenticated" USING ("public"."has_permission"("auth"."uid"(), 'access.admin'::"text", false));
+
+
+
+CREATE POLICY "vehicle project days update" ON "public"."vehicle_project_days" FOR UPDATE TO "authenticated" USING ("public"."has_permission"("auth"."uid"(), 'access.admin'::"text", false)) WITH CHECK ("public"."has_permission"("auth"."uid"(), 'access.admin'::"text", false));
+
+
+
 ALTER TABLE "public"."vehicle_assignments" ENABLE ROW LEVEL SECURITY;
 
 
@@ -11906,6 +12259,9 @@ ALTER TABLE "public"."vehicle_defect_items" ENABLE ROW LEVEL SECURITY;
 
 
 ALTER TABLE "public"."vehicle_defects" ENABLE ROW LEVEL SECURITY;
+
+
+ALTER TABLE "public"."vehicle_project_days" ENABLE ROW LEVEL SECURITY;
 
 
 ALTER TABLE "public"."vehicle_service_records" ENABLE ROW LEVEL SECURITY;
@@ -12280,6 +12636,11 @@ REVOKE ALL ON FUNCTION "public"."aggregate_invoices"("p_f_text" "text", "p_f_cli
 GRANT ALL ON FUNCTION "public"."aggregate_invoices"("p_f_text" "text", "p_f_client" "uuid", "p_f_from" "date", "p_f_to" "date", "p_f_vat" "text", "p_f_project" "text") TO "anon";
 GRANT ALL ON FUNCTION "public"."aggregate_invoices"("p_f_text" "text", "p_f_client" "uuid", "p_f_from" "date", "p_f_to" "date", "p_f_vat" "text", "p_f_project" "text") TO "authenticated";
 GRANT ALL ON FUNCTION "public"."aggregate_invoices"("p_f_text" "text", "p_f_client" "uuid", "p_f_from" "date", "p_f_to" "date", "p_f_vat" "text", "p_f_project" "text") TO "service_role";
+
+
+
+REVOKE ALL ON FUNCTION "public"."assert_cost_company_name_editor"() FROM PUBLIC;
+GRANT ALL ON FUNCTION "public"."assert_cost_company_name_editor"() TO "service_role";
 
 
 
@@ -13124,6 +13485,12 @@ GRANT ALL ON FUNCTION "public"."refresh_cost_invoice_monthly_rollups"() TO "serv
 
 
 
+REVOKE ALL ON FUNCTION "public"."rename_cost_company_display"("p_from" "text", "p_to" "text") FROM PUBLIC;
+GRANT ALL ON FUNCTION "public"."rename_cost_company_display"("p_from" "text", "p_to" "text") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."rename_cost_company_display"("p_from" "text", "p_to" "text") TO "service_role";
+
+
+
 REVOKE ALL ON FUNCTION "public"."resolve_company_from_costs_table"("p_domain" "text", "p_format_key" "text", "p_pdf_name" "text") FROM PUBLIC;
 GRANT ALL ON FUNCTION "public"."resolve_company_from_costs_table"("p_domain" "text", "p_format_key" "text", "p_pdf_name" "text") TO "authenticated";
 GRANT ALL ON FUNCTION "public"."resolve_company_from_costs_table"("p_domain" "text", "p_format_key" "text", "p_pdf_name" "text") TO "service_role";
@@ -13167,6 +13534,12 @@ GRANT ALL ON FUNCTION "public"."revenue_entries_before_insert"() TO "service_rol
 
 REVOKE ALL ON FUNCTION "public"."run_statement_payment_reconcile_backfill_once"() FROM PUBLIC;
 GRANT ALL ON FUNCTION "public"."run_statement_payment_reconcile_backfill_once"() TO "service_role";
+
+
+
+REVOKE ALL ON FUNCTION "public"."set_cost_invoice_company_override"("p_id" "uuid", "p_company_name" "text") FROM PUBLIC;
+GRANT ALL ON FUNCTION "public"."set_cost_invoice_company_override"("p_id" "uuid", "p_company_name" "text") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."set_cost_invoice_company_override"("p_id" "uuid", "p_company_name" "text") TO "service_role";
 
 
 
@@ -13400,6 +13773,18 @@ GRANT ALL ON TABLE "public"."cost_invoice_splits" TO "service_role";
 GRANT ALL ON TABLE "public"."cost_payment_remittances" TO "anon";
 GRANT ALL ON TABLE "public"."cost_payment_remittances" TO "authenticated";
 GRANT ALL ON TABLE "public"."cost_payment_remittances" TO "service_role";
+
+
+
+GRANT ALL ON TABLE "public"."cost_report_assumptions" TO "anon";
+GRANT ALL ON TABLE "public"."cost_report_assumptions" TO "authenticated";
+GRANT ALL ON TABLE "public"."cost_report_assumptions" TO "service_role";
+
+
+
+GRANT ALL ON TABLE "public"."cost_report_cost_assumptions" TO "anon";
+GRANT ALL ON TABLE "public"."cost_report_cost_assumptions" TO "authenticated";
+GRANT ALL ON TABLE "public"."cost_report_cost_assumptions" TO "service_role";
 
 
 
@@ -13819,6 +14204,12 @@ GRANT ALL ON TABLE "public"."vehicle_defect_items" TO "service_role";
 GRANT ALL ON TABLE "public"."vehicle_defects" TO "anon";
 GRANT ALL ON TABLE "public"."vehicle_defects" TO "authenticated";
 GRANT ALL ON TABLE "public"."vehicle_defects" TO "service_role";
+
+
+
+GRANT ALL ON TABLE "public"."vehicle_project_days" TO "anon";
+GRANT ALL ON TABLE "public"."vehicle_project_days" TO "authenticated";
+GRANT ALL ON TABLE "public"."vehicle_project_days" TO "service_role";
 
 
 
