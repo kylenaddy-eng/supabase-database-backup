@@ -2631,8 +2631,10 @@ CREATE TABLE IF NOT EXISTS "public"."cost_invoices" (
     "is_vehicle_purchase" boolean DEFAULT false NOT NULL,
     "vehicle_monthly_cost" numeric(12,2),
     "vehicle_is_financed" boolean DEFAULT false NOT NULL,
+    "is_vehicle_hire" boolean DEFAULT false NOT NULL,
     CONSTRAINT "cost_invoices_document_type_check" CHECK (("document_type" = ANY (ARRAY['invoice'::"text", 'credit_note'::"text", 'pro_forma'::"text"]))),
     CONSTRAINT "cost_invoices_overhead_spread_months_check" CHECK ((("overhead_spread_months" IS NULL) OR ("overhead_spread_months" = ANY (ARRAY[12, 24, 36, 48, 60])))),
+    CONSTRAINT "cost_invoices_vehicle_hire_check" CHECK (((NOT ("is_vehicle_hire" AND "is_vehicle_service")) AND (NOT ("is_vehicle_hire" AND "is_vehicle_purchase")) AND ((NOT "is_vehicle_hire") OR ("vehicle_id" IS NOT NULL)))),
     CONSTRAINT "cost_invoices_vehicle_monthly_cost_nonnegative" CHECK ((("vehicle_monthly_cost" IS NULL) OR ("vehicle_monthly_cost" >= (0)::numeric))),
     CONSTRAINT "cost_invoices_vehicle_purchase_not_service" CHECK (((NOT ("is_vehicle_purchase" AND "is_vehicle_service")) AND ((NOT "is_vehicle_purchase") OR ("vehicle_id" IS NOT NULL))))
 );
@@ -9207,6 +9209,21 @@ ALTER TABLE ONLY "public"."user_roles" REPLICA IDENTITY FULL;
 ALTER TABLE "public"."user_roles" OWNER TO "postgres";
 
 
+CREATE TABLE IF NOT EXISTS "public"."vehicle_assignment_periods" (
+    "id" "uuid" DEFAULT "gen_random_uuid"() NOT NULL,
+    "vehicle_id" "uuid" NOT NULL,
+    "user_id" "uuid" NOT NULL,
+    "starts_on" "date" NOT NULL,
+    "ends_on" "date",
+    "created_by" "uuid",
+    "created_at" timestamp with time zone DEFAULT "now"() NOT NULL,
+    CONSTRAINT "vehicle_assignment_periods_dates_check" CHECK ((("ends_on" IS NULL) OR ("ends_on" >= "starts_on")))
+);
+
+
+ALTER TABLE "public"."vehicle_assignment_periods" OWNER TO "postgres";
+
+
 CREATE TABLE IF NOT EXISTS "public"."vehicle_assignments" (
     "id" "uuid" DEFAULT "gen_random_uuid"() NOT NULL,
     "vehicle_id" "uuid" NOT NULL,
@@ -9300,7 +9317,13 @@ CREATE TABLE IF NOT EXISTS "public"."vehicles" (
     "mot_reminded_at" timestamp with time zone,
     "tax_reminded_at" timestamp with time zone,
     "archived_at" timestamp with time zone,
-    "archived_by" "uuid"
+    "archived_by" "uuid",
+    "purchase_spread_months" smallint,
+    "purchase_start_month" "date",
+    "purchase_monthly_cost" numeric(12,2),
+    "purchase_is_financed" boolean DEFAULT false NOT NULL,
+    CONSTRAINT "vehicles_purchase_monthly_cost_nonnegative" CHECK ((("purchase_monthly_cost" IS NULL) OR ("purchase_monthly_cost" >= (0)::numeric))),
+    CONSTRAINT "vehicles_purchase_spread_months_check" CHECK ((("purchase_spread_months" IS NULL) OR ("purchase_spread_months" = ANY (ARRAY[12, 24, 36, 48, 60]))))
 );
 
 
@@ -9795,6 +9818,11 @@ ALTER TABLE ONLY "public"."user_roles"
 
 
 
+ALTER TABLE ONLY "public"."vehicle_assignment_periods"
+    ADD CONSTRAINT "vehicle_assignment_periods_pkey" PRIMARY KEY ("id");
+
+
+
 ALTER TABLE ONLY "public"."vehicle_assignments"
     ADD CONSTRAINT "vehicle_assignments_pkey" PRIMARY KEY ("id");
 
@@ -9955,6 +9983,10 @@ CREATE INDEX "cost_invoices_status_idx" ON "public"."cost_invoices" USING "btree
 
 
 CREATE UNIQUE INDEX "cost_invoices_unique_company_invoice_number" ON "public"."cost_invoices" USING "btree" ("company_invoice_key", "invoice_number_key") WHERE (("company_invoice_key" IS NOT NULL) AND ("invoice_number_key" IS NOT NULL) AND ("invoice_number_key" <> ALL (ARRAY['NA'::"text", 'N/A'::"text", 'NO-NUMBER'::"text", 'NONUMBER'::"text", 'NO_NUMBER'::"text"])));
+
+
+
+CREATE INDEX "cost_invoices_vehicle_hire_idx" ON "public"."cost_invoices" USING "btree" ("vehicle_id", "invoice_date") WHERE "is_vehicle_hire";
 
 
 
@@ -10251,6 +10283,14 @@ CREATE INDEX "user_notifications_user_created_idx" ON "public"."user_notificatio
 
 
 CREATE INDEX "user_notifications_user_unread_idx" ON "public"."user_notifications" USING "btree" ("user_id", "created_at" DESC) WHERE ("read_at" IS NULL);
+
+
+
+CREATE UNIQUE INDEX "vehicle_assignment_periods_one_open" ON "public"."vehicle_assignment_periods" USING "btree" ("vehicle_id") WHERE ("ends_on" IS NULL);
+
+
+
+CREATE INDEX "vehicle_assignment_periods_vehicle_idx" ON "public"."vehicle_assignment_periods" USING "btree" ("vehicle_id", "starts_on");
 
 
 
@@ -11140,6 +11180,21 @@ ALTER TABLE ONLY "public"."user_roles"
 
 ALTER TABLE ONLY "public"."user_roles"
     ADD CONSTRAINT "user_roles_user_id_fkey" FOREIGN KEY ("user_id") REFERENCES "auth"."users"("id") ON DELETE CASCADE;
+
+
+
+ALTER TABLE ONLY "public"."vehicle_assignment_periods"
+    ADD CONSTRAINT "vehicle_assignment_periods_created_by_fkey" FOREIGN KEY ("created_by") REFERENCES "auth"."users"("id") ON DELETE SET NULL;
+
+
+
+ALTER TABLE ONLY "public"."vehicle_assignment_periods"
+    ADD CONSTRAINT "vehicle_assignment_periods_user_id_fkey" FOREIGN KEY ("user_id") REFERENCES "auth"."users"("id") ON DELETE CASCADE;
+
+
+
+ALTER TABLE ONLY "public"."vehicle_assignment_periods"
+    ADD CONSTRAINT "vehicle_assignment_periods_vehicle_id_fkey" FOREIGN KEY ("vehicle_id") REFERENCES "public"."vehicles"("id") ON DELETE CASCADE;
 
 
 
@@ -12220,6 +12275,22 @@ CREATE POLICY "vd_items read" ON "public"."vehicle_defect_items" FOR SELECT TO "
 
 
 
+CREATE POLICY "vehicle assignment periods admin delete" ON "public"."vehicle_assignment_periods" FOR DELETE TO "authenticated" USING ("public"."has_permission"("auth"."uid"(), 'access.admin'::"text", false));
+
+
+
+CREATE POLICY "vehicle assignment periods admin insert" ON "public"."vehicle_assignment_periods" FOR INSERT TO "authenticated" WITH CHECK ("public"."has_permission"("auth"."uid"(), 'access.admin'::"text", false));
+
+
+
+CREATE POLICY "vehicle assignment periods admin update" ON "public"."vehicle_assignment_periods" FOR UPDATE TO "authenticated" USING ("public"."has_permission"("auth"."uid"(), 'access.admin'::"text", false)) WITH CHECK ("public"."has_permission"("auth"."uid"(), 'access.admin'::"text", false));
+
+
+
+CREATE POLICY "vehicle assignment periods read" ON "public"."vehicle_assignment_periods" FOR SELECT TO "authenticated" USING ((("user_id" = "auth"."uid"()) OR "public"."has_permission"("auth"."uid"(), 'access.admin'::"text", false)));
+
+
+
 CREATE POLICY "vehicle assignments admin delete" ON "public"."vehicle_assignments" FOR DELETE TO "authenticated" USING ("public"."has_permission"("auth"."uid"(), 'access.admin'::"text", false));
 
 
@@ -12250,6 +12321,9 @@ CREATE POLICY "vehicle project days read" ON "public"."vehicle_project_days" FOR
 
 CREATE POLICY "vehicle project days update" ON "public"."vehicle_project_days" FOR UPDATE TO "authenticated" USING ("public"."has_permission"("auth"."uid"(), 'access.admin'::"text", false)) WITH CHECK ("public"."has_permission"("auth"."uid"(), 'access.admin'::"text", false));
 
+
+
+ALTER TABLE "public"."vehicle_assignment_periods" ENABLE ROW LEVEL SECURITY;
 
 
 ALTER TABLE "public"."vehicle_assignments" ENABLE ROW LEVEL SECURITY;
@@ -14186,6 +14260,12 @@ GRANT ALL ON TABLE "public"."user_notifications" TO "service_role";
 GRANT ALL ON TABLE "public"."user_roles" TO "anon";
 GRANT ALL ON TABLE "public"."user_roles" TO "authenticated";
 GRANT ALL ON TABLE "public"."user_roles" TO "service_role";
+
+
+
+GRANT ALL ON TABLE "public"."vehicle_assignment_periods" TO "anon";
+GRANT ALL ON TABLE "public"."vehicle_assignment_periods" TO "authenticated";
+GRANT ALL ON TABLE "public"."vehicle_assignment_periods" TO "service_role";
 
 
 
