@@ -6049,7 +6049,7 @@ CREATE OR REPLACE FUNCTION "public"."list_submissions_browser"("p_from" "date", 
       'timesheet'::text AS kind,
       t.id,
       t.worker_id,
-      COALESCE(p.full_name, p.username, 'Unknown') AS who,
+      CASE WHEN t.worker_id IS NULL THEN '(deleted user)' ELSE COALESCE(p.full_name, p.username, 'Unknown') END AS who,
       s.name AS group_name,
       'Week ending ' || to_char(t.week_ending::date, 'DD Mon YYYY') AS label,
       t.status::text AS status,
@@ -6075,7 +6075,7 @@ CREATE OR REPLACE FUNCTION "public"."list_submissions_browser"("p_from" "date", 
       'plant_inspection',
       pi.id,
       pi.worker_id,
-      COALESCE(p.full_name, p.username, 'Unknown'),
+      CASE WHEN pi.worker_id IS NULL THEN '(deleted user)' ELSE COALESCE(p.full_name, p.username, 'Unknown') END,
       s.name,
       'Plant: ' || COALESCE(pi.plant_description, ''),
       pi.status::text,
@@ -6099,7 +6099,7 @@ CREATE OR REPLACE FUNCTION "public"."list_submissions_browser"("p_from" "date", 
       'vehicle_defect',
       vd.id,
       vd.worker_id,
-      COALESCE(p.full_name, p.username, 'Unknown'),
+      CASE WHEN vd.worker_id IS NULL THEN '(deleted user)' ELSE COALESCE(p.full_name, p.username, 'Unknown') END,
       s.name,
       'Vehicle: ' || COALESCE(vd.vehicle_registration, ''),
       vd.status::text,
@@ -6123,7 +6123,7 @@ CREATE OR REPLACE FUNCTION "public"."list_submissions_browser"("p_from" "date", 
       'rams_briefing',
       rb.id,
       rb.briefer_id,
-      COALESCE(p.full_name, p.username, 'Unknown'),
+      CASE WHEN rb.briefer_id IS NULL THEN '(deleted user)' ELSE COALESCE(p.full_name, p.username, 'Unknown') END,
       s.name,
       'RAMS: ' || COALESCE(rb.method_statement_title, ''),
       rb.status::text,
@@ -6144,7 +6144,14 @@ CREATE OR REPLACE FUNCTION "public"."list_submissions_browser"("p_from" "date", 
       'havs_log',
       hl.id,
       hl.worker_id,
-      COALESCE(p.full_name, p.username, 'Unknown'),
+      CASE
+        WHEN hl.worker_id IS NULL THEN
+          CASE
+            WHEN NULLIF(trim(hl.worker_name), '') IS NULL THEN '(deleted user)'
+            ELSE trim(hl.worker_name) || ' (deleted user)'
+          END
+        ELSE COALESCE(p.full_name, p.username, 'Unknown')
+      END,
       s.name,
       'HAVS · ' || COALESCE(hl.total_points::text, '0') || ' pts',
       hl.status::text,
@@ -6165,7 +6172,7 @@ CREATE OR REPLACE FUNCTION "public"."list_submissions_browser"("p_from" "date", 
       'toolbox_talk',
       tt.id,
       tt.briefer_id,
-      COALESCE(p.full_name, p.username, 'Unknown'),
+      CASE WHEN tt.briefer_id IS NULL THEN '(deleted user)' ELSE COALESCE(p.full_name, p.username, 'Unknown') END,
       s.name,
       'Toolbox: ' || COALESCE(tt.topic, ''),
       tt.status::text,
@@ -6186,7 +6193,7 @@ CREATE OR REPLACE FUNCTION "public"."list_submissions_browser"("p_from" "date", 
       'daily_briefing',
       db.id,
       db.briefer_id,
-      COALESCE(p.full_name, p.username, 'Unknown'),
+      CASE WHEN db.briefer_id IS NULL THEN '(deleted user)' ELSE COALESCE(p.full_name, p.username, 'Unknown') END,
       s.name,
       'Daily Briefing · ' || to_char(db.time_delivered, 'DD Mon YYYY HH24:MI'),
       db.status::text,
@@ -6798,6 +6805,24 @@ $$;
 
 
 ALTER FUNCTION "public"."parse_description_filter_terms"("p_f_description" "text") OWNER TO "postgres";
+
+
+CREATE OR REPLACE FUNCTION "public"."pay_basis_for_user"("_user_id" "uuid") RETURNS "text"
+    LANGUAGE "sql" STABLE SECURITY DEFINER
+    SET "search_path" TO 'public'
+    AS $$
+  SELECT COALESCE(
+    (
+      SELECT ep.pay_basis
+      FROM public.employee_pay ep
+      WHERE ep.user_id = _user_id
+    ),
+    'shift'
+  );
+$$;
+
+
+ALTER FUNCTION "public"."pay_basis_for_user"("_user_id" "uuid") OWNER TO "postgres";
 
 
 CREATE OR REPLACE FUNCTION "public"."pick_domain_canonical"("p_domain" "text") RETURNS "text"
@@ -7984,6 +8009,7 @@ CREATE OR REPLACE FUNCTION "public"."timesheets_snapshot_and_autoapprove"() RETU
     AS $$
 DECLARE
   v_rate numeric(10,2);
+  v_basis text;
   v_actor uuid;
 BEGIN
   v_actor := auth.uid();
@@ -8053,12 +8079,22 @@ BEGIN
   END IF;
 
   IF NEW.status = 'approved' THEN
-    SELECT shift_rate INTO v_rate FROM public.employee_pay WHERE user_id = NEW.worker_id;
+    SELECT ep.shift_rate, ep.pay_basis
+      INTO v_rate, v_basis
+    FROM public.employee_pay ep
+    WHERE ep.user_id = NEW.worker_id;
+
+    IF v_basis IS NULL OR v_basis NOT IN ('shift', 'hourly') THEN
+      v_basis := 'shift';
+    END IF;
+
     IF TG_OP = 'INSERT' THEN
       NEW.snapshot_shift_rate := COALESCE(v_rate, 0);
+      NEW.snapshot_pay_basis := v_basis;
     ELSIF TG_OP = 'UPDATE' THEN
       IF OLD.status <> 'approved' OR OLD.snapshot_shift_rate IS NULL THEN
         NEW.snapshot_shift_rate := COALESCE(v_rate, 0);
+        NEW.snapshot_pay_basis := v_basis;
       END IF;
     END IF;
   END IF;
@@ -8115,76 +8151,7 @@ CREATE OR REPLACE FUNCTION "public"."trigger_nas_sync_dispatch_on_enqueue"() RET
     LANGUAGE "plpgsql" SECURITY DEFINER
     SET "search_path" TO 'public'
     AS $$
-DECLARE
-  v_apikey text;
-  v_github_token text;
 BEGIN
-  IF NEW.status IS DISTINCT FROM 'pending' THEN
-    RETURN NEW;
-  END IF;
-
-  IF NEW.kind NOT IN (
-    'timesheet',
-    'plant_inspection',
-    'vehicle_defect',
-    'rams_briefing',
-    'starter',
-    'havs_log',
-    'toolbox_talk',
-    'daily_briefing',
-    'invoice'
-  ) THEN
-    RETURN NEW;
-  END IF;
-
-  SELECT decrypted_secret INTO v_github_token
-  FROM vault.decrypted_secrets
-  WHERE name = 'github_dispatch_token';
-
-  IF v_github_token IS NOT NULL AND v_github_token <> '' THEN
-    PERFORM net.http_post(
-      url := 'https://api.github.com/repos/CJB-Civil-Engineering-Ltd/project-data-hub/dispatches',
-      headers := jsonb_build_object(
-        'Authorization', 'Bearer ' || v_github_token,
-        'Accept', 'application/vnd.github+json',
-        'X-GitHub-Api-Version', '2022-11-28',
-        'Content-Type', 'application/json',
-        'User-Agent', 'cjb-project-data-hub-nas-sync'
-      ),
-      body := jsonb_build_object(
-        'event_type', 'nas-sync-stage',
-        'client_payload', jsonb_build_object(
-          'kind', NEW.kind,
-          'submission_id', NEW.submission_id
-        )
-      ),
-      timeout_milliseconds := 15000
-    );
-    RETURN NEW;
-  END IF;
-
-  SELECT decrypted_secret INTO v_apikey
-  FROM vault.decrypted_secrets
-  WHERE name = 'cost_hooks_service_key';
-
-  IF v_apikey IS NULL OR v_apikey = '' THEN
-    RAISE WARNING 'nas_sync dispatch trigger: github_dispatch_token and cost_hooks_service_key both missing';
-    RETURN NEW;
-  END IF;
-
-  PERFORM net.http_post(
-    url := 'https://portal.cjbce.co.uk/api/public/hooks/nas-sync-dispatch',
-    headers := jsonb_build_object(
-      'Content-Type', 'application/json',
-      'apikey', v_apikey
-    ),
-    body := jsonb_build_object(
-      'kind', NEW.kind,
-      'submissionId', NEW.submission_id
-    ),
-    timeout_milliseconds := 15000
-  );
-
   RETURN NEW;
 END;
 $$;
@@ -8848,7 +8815,9 @@ CREATE TABLE IF NOT EXISTS "public"."employee_pay" (
     "shift_rate" numeric(10,2) DEFAULT 0 NOT NULL,
     "currency" "text" DEFAULT 'GBP'::"text" NOT NULL,
     "updated_at" timestamp with time zone DEFAULT "now"() NOT NULL,
-    "updated_by" "uuid"
+    "updated_by" "uuid",
+    "pay_basis" "text" DEFAULT 'shift'::"text" NOT NULL,
+    CONSTRAINT "employee_pay_pay_basis_check" CHECK (("pay_basis" = ANY (ARRAY['shift'::"text", 'hourly'::"text"])))
 );
 
 
@@ -9373,7 +9342,7 @@ ALTER TABLE "public"."rams_briefings" OWNER TO "postgres";
 
 CREATE TABLE IF NOT EXISTS "public"."rams_documents" (
     "id" "uuid" DEFAULT "gen_random_uuid"() NOT NULL,
-    "created_by" "uuid" NOT NULL,
+    "created_by" "uuid",
     "created_at" timestamp with time zone DEFAULT "now"() NOT NULL,
     "updated_at" timestamp with time zone DEFAULT "now"() NOT NULL,
     "status" "text" DEFAULT 'draft'::"text" NOT NULL,
@@ -9516,7 +9485,7 @@ CREATE TABLE IF NOT EXISTS "public"."timesheet_pending_amendments" (
     "week_ending" "date" NOT NULL,
     "signature_url" "text" NOT NULL,
     "submitted_at" timestamp with time zone DEFAULT "now"() NOT NULL,
-    "submitted_by" "uuid" NOT NULL
+    "submitted_by" "uuid"
 );
 
 
@@ -9537,7 +9506,9 @@ CREATE TABLE IF NOT EXISTS "public"."timesheets" (
     "rejection_reason" "text",
     "revision" integer DEFAULT 1 NOT NULL,
     "change_requested_at" timestamp with time zone,
-    "change_requested_by" "uuid"
+    "change_requested_by" "uuid",
+    "snapshot_pay_basis" "text",
+    CONSTRAINT "timesheets_snapshot_pay_basis_check" CHECK ((("snapshot_pay_basis" IS NULL) OR ("snapshot_pay_basis" = ANY (ARRAY['shift'::"text", 'hourly'::"text"]))))
 );
 
 
@@ -9703,7 +9674,7 @@ ALTER TABLE "public"."user_roles" OWNER TO "postgres";
 CREATE TABLE IF NOT EXISTS "public"."vehicle_assignment_periods" (
     "id" "uuid" DEFAULT "gen_random_uuid"() NOT NULL,
     "vehicle_id" "uuid" NOT NULL,
-    "user_id" "uuid" NOT NULL,
+    "user_id" "uuid",
     "starts_on" "date" NOT NULL,
     "ends_on" "date",
     "created_by" "uuid",
@@ -11241,7 +11212,7 @@ ALTER TABLE ONLY "public"."cost_supplier_statements"
 
 
 ALTER TABLE ONLY "public"."daily_briefing_attendees"
-    ADD CONSTRAINT "daily_briefing_attendees_briefed_by_user_id_fkey" FOREIGN KEY ("briefed_by_user_id") REFERENCES "public"."profiles"("id");
+    ADD CONSTRAINT "daily_briefing_attendees_briefed_by_user_id_fkey" FOREIGN KEY ("briefed_by_user_id") REFERENCES "public"."profiles"("id") ON DELETE SET NULL;
 
 
 
@@ -11281,7 +11252,7 @@ ALTER TABLE ONLY "public"."daily_briefings"
 
 
 ALTER TABLE ONLY "public"."employee_pay"
-    ADD CONSTRAINT "employee_pay_updated_by_fkey" FOREIGN KEY ("updated_by") REFERENCES "auth"."users"("id");
+    ADD CONSTRAINT "employee_pay_updated_by_fkey" FOREIGN KEY ("updated_by") REFERENCES "auth"."users"("id") ON DELETE SET NULL;
 
 
 
@@ -11371,7 +11342,7 @@ ALTER TABLE ONLY "public"."plant_inspection_items"
 
 
 ALTER TABLE ONLY "public"."plant_inspection_items"
-    ADD CONSTRAINT "plant_inspection_items_repaired_by_fkey" FOREIGN KEY ("repaired_by") REFERENCES "auth"."users"("id");
+    ADD CONSTRAINT "plant_inspection_items_repaired_by_fkey" FOREIGN KEY ("repaired_by") REFERENCES "auth"."users"("id") ON DELETE SET NULL;
 
 
 
@@ -11441,7 +11412,7 @@ ALTER TABLE ONLY "public"."push_subscriptions"
 
 
 ALTER TABLE ONLY "public"."rams_attendees"
-    ADD CONSTRAINT "rams_attendees_briefed_by_user_id_fkey" FOREIGN KEY ("briefed_by_user_id") REFERENCES "public"."profiles"("id");
+    ADD CONSTRAINT "rams_attendees_briefed_by_user_id_fkey" FOREIGN KEY ("briefed_by_user_id") REFERENCES "public"."profiles"("id") ON DELETE SET NULL;
 
 
 
@@ -11481,7 +11452,7 @@ ALTER TABLE ONLY "public"."rams_documents"
 
 
 ALTER TABLE ONLY "public"."rams_documents"
-    ADD CONSTRAINT "rams_documents_created_by_fkey" FOREIGN KEY ("created_by") REFERENCES "auth"."users"("id") ON DELETE CASCADE;
+    ADD CONSTRAINT "rams_documents_created_by_fkey" FOREIGN KEY ("created_by") REFERENCES "auth"."users"("id") ON DELETE SET NULL;
 
 
 
@@ -11551,7 +11522,7 @@ ALTER TABLE ONLY "public"."timesheet_pending_amendment_days"
 
 
 ALTER TABLE ONLY "public"."timesheet_pending_amendments"
-    ADD CONSTRAINT "timesheet_pending_amendments_submitted_by_fkey" FOREIGN KEY ("submitted_by") REFERENCES "auth"."users"("id");
+    ADD CONSTRAINT "timesheet_pending_amendments_submitted_by_fkey" FOREIGN KEY ("submitted_by") REFERENCES "auth"."users"("id") ON DELETE SET NULL;
 
 
 
@@ -11641,7 +11612,7 @@ ALTER TABLE ONLY "public"."todo_lists"
 
 
 ALTER TABLE ONLY "public"."toolbox_attendees"
-    ADD CONSTRAINT "toolbox_attendees_briefed_by_user_id_fkey" FOREIGN KEY ("briefed_by_user_id") REFERENCES "public"."profiles"("id");
+    ADD CONSTRAINT "toolbox_attendees_briefed_by_user_id_fkey" FOREIGN KEY ("briefed_by_user_id") REFERENCES "public"."profiles"("id") ON DELETE SET NULL;
 
 
 
@@ -11696,7 +11667,7 @@ ALTER TABLE ONLY "public"."vehicle_assignment_periods"
 
 
 ALTER TABLE ONLY "public"."vehicle_assignment_periods"
-    ADD CONSTRAINT "vehicle_assignment_periods_user_id_fkey" FOREIGN KEY ("user_id") REFERENCES "auth"."users"("id") ON DELETE CASCADE;
+    ADD CONSTRAINT "vehicle_assignment_periods_user_id_fkey" FOREIGN KEY ("user_id") REFERENCES "auth"."users"("id") ON DELETE SET NULL;
 
 
 
@@ -11726,7 +11697,7 @@ ALTER TABLE ONLY "public"."vehicle_defect_items"
 
 
 ALTER TABLE ONLY "public"."vehicle_defect_items"
-    ADD CONSTRAINT "vehicle_defect_items_repaired_by_fkey" FOREIGN KEY ("repaired_by") REFERENCES "auth"."users"("id");
+    ADD CONSTRAINT "vehicle_defect_items_repaired_by_fkey" FOREIGN KEY ("repaired_by") REFERENCES "auth"."users"("id") ON DELETE SET NULL;
 
 
 
@@ -14047,6 +14018,12 @@ GRANT ALL ON FUNCTION "public"."owns_submission"("_kind" "public"."submission_ki
 GRANT ALL ON FUNCTION "public"."parse_description_filter_terms"("p_f_description" "text") TO "anon";
 GRANT ALL ON FUNCTION "public"."parse_description_filter_terms"("p_f_description" "text") TO "authenticated";
 GRANT ALL ON FUNCTION "public"."parse_description_filter_terms"("p_f_description" "text") TO "service_role";
+
+
+
+REVOKE ALL ON FUNCTION "public"."pay_basis_for_user"("_user_id" "uuid") FROM PUBLIC;
+GRANT ALL ON FUNCTION "public"."pay_basis_for_user"("_user_id" "uuid") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."pay_basis_for_user"("_user_id" "uuid") TO "service_role";
 
 
 
