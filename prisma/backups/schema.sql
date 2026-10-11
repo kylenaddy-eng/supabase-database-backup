@@ -345,7 +345,7 @@ CREATE OR REPLACE FUNCTION "public"."aggregate_cost_invoice_summary"("p_f_text" 
     LANGUAGE "sql" STABLE SECURITY DEFINER
     SET "search_path" TO 'public'
     AS $_$
-  WITH filtered AS (
+  WITH base AS (
     SELECT ci.*
     FROM public.cost_invoices ci
     WHERE (
@@ -365,8 +365,8 @@ CREATE OR REPLACE FUNCTION "public"."aggregate_cost_invoice_summary"("p_f_text" 
         ci,
         p_f_text, p_f_description, p_f_treatment, p_f_status, p_f_doc_type, p_f_company,
         p_f_from, p_f_to, p_f_po, p_f_due_from, p_f_due_to, p_f_paid, p_f_cis,
-        p_f_project, p_f_check, p_dup_only, p_missing_due_date, p_f_credit_card,
-        p_amount_conflict_only, false, NULL::text, p_overdue_only, p_f_confidential,
+        p_f_project, p_f_check, p_dup_only, false, p_f_credit_card,
+        false, false, NULL::text, false, p_f_confidential,
         p_f_vehicle_service, p_f_vehicle_id
       )
       AND NOT EXISTS (
@@ -386,105 +386,24 @@ CREATE OR REPLACE FUNCTION "public"."aggregate_cost_invoice_summary"("p_f_text" 
         ELSE public.cost_invoice_matches_relation_filters(ci, p_f_text, p_f_description, p_f_project)
       END
   ),
-  filtered_for_missing_count AS (
-    SELECT ci.*
-    FROM public.cost_invoices ci
-    WHERE (
-        coalesce(nullif(btrim(p_f_company), ''), NULL) IS NULL
-        OR lower(ci.company_name) = lower(btrim(p_f_company))
-        OR ci.supplier_id = ANY (ARRAY(
-          SELECT cs.id
-          FROM public.cost_suppliers cs
-          WHERE coalesce(nullif(btrim(p_f_company), ''), NULL) IS NOT NULL
-            AND (
-              lower(cs.canonical_name) = lower(btrim(p_f_company))
-              OR public.company_match_key(cs.canonical_name) = public.company_match_key(p_f_company)
-            )
-        ))
-      )
-      AND public.cost_invoice_passes_scalar_filters(
-        ci,
-        p_f_text, p_f_description, p_f_treatment, p_f_status, p_f_doc_type, p_f_company,
-        p_f_from, p_f_to, p_f_po, p_f_due_from, p_f_due_to, p_f_paid, p_f_cis,
-        p_f_project, p_f_check, p_dup_only,
-        false,
-        p_f_credit_card,
-        false,
-        false,
-        NULL::text,
-        false,
-        p_f_confidential,
-        p_f_vehicle_service,
-        p_f_vehicle_id
-      )
-      AND NOT EXISTS (
-        SELECT 1
-        FROM public.invoices o
-        WHERE btrim(coalesce(ci.invoice_number, '')) ~ '^[0-9]+$'
-          AND o.invoice_number::text = btrim(ci.invoice_number)
-      )
+  filtered AS (
+    SELECT b.*
+    FROM base b
+    WHERE (NOT p_missing_due_date OR b.due_date IS NULL)
+      AND (NOT p_amount_conflict_only OR b.has_amount_conflict)
       AND (
-        coalesce(btrim(p_f_text), '') = ''
-        OR ci.search_text LIKE '%' || replace(replace(replace(lower(btrim(p_f_text)), '\', '\\'), '%', '\%'), '_', '\_') || '%' ESCAPE '\'
+        NOT p_overdue_only
+        OR (
+          b.status = 'reviewed'
+          AND b.paid_at IS NULL
+          AND b.due_date IS NOT NULL
+          AND b.due_date < current_date
+        )
       )
-      AND CASE
-        WHEN cardinality(public.parse_description_filter_terms(p_f_description)) = 0
-         AND coalesce(btrim(p_f_project), '') = ''
-        THEN true
-        ELSE public.cost_invoice_matches_relation_filters(ci, p_f_text, p_f_description, p_f_project)
-      END
-  ),
-  filtered_for_overdue_count AS (
-    SELECT ci.*
-    FROM public.cost_invoices ci
-    WHERE (
-        coalesce(nullif(btrim(p_f_company), ''), NULL) IS NULL
-        OR lower(ci.company_name) = lower(btrim(p_f_company))
-        OR ci.supplier_id = ANY (ARRAY(
-          SELECT cs.id
-          FROM public.cost_suppliers cs
-          WHERE coalesce(nullif(btrim(p_f_company), ''), NULL) IS NOT NULL
-            AND (
-              lower(cs.canonical_name) = lower(btrim(p_f_company))
-              OR public.company_match_key(cs.canonical_name) = public.company_match_key(p_f_company)
-            )
-        ))
-      )
-      AND public.cost_invoice_passes_scalar_filters(
-        ci,
-        p_f_text, p_f_description, p_f_treatment, p_f_status, p_f_doc_type, p_f_company,
-        p_f_from, p_f_to, p_f_po, p_f_due_from, p_f_due_to, p_f_paid, p_f_cis,
-        p_f_project, p_f_check, p_dup_only,
-        false,
-        p_f_credit_card,
-        false,
-        false,
-        NULL::text,
-        false,
-        p_f_confidential,
-        p_f_vehicle_service,
-        p_f_vehicle_id
-      )
-      AND NOT EXISTS (
-        SELECT 1
-        FROM public.invoices o
-        WHERE btrim(coalesce(ci.invoice_number, '')) ~ '^[0-9]+$'
-          AND o.invoice_number::text = btrim(ci.invoice_number)
-      )
-      AND (
-        coalesce(btrim(p_f_text), '') = ''
-        OR ci.search_text LIKE '%' || replace(replace(replace(lower(btrim(p_f_text)), '\', '\\'), '%', '\%'), '_', '\_') || '%' ESCAPE '\'
-      )
-      AND CASE
-        WHEN cardinality(public.parse_description_filter_terms(p_f_description)) = 0
-         AND coalesce(btrim(p_f_project), '') = ''
-        THEN true
-        ELSE public.cost_invoice_matches_relation_filters(ci, p_f_text, p_f_description, p_f_project)
-      END
   ),
   missing_due_date_count AS (
     SELECT count(*)::bigint AS cnt
-    FROM filtered_for_missing_count f
+    FROM base f
     WHERE f.due_date IS NULL
       AND coalesce(f.document_type, 'invoice') <> 'pro_forma'
   ),
@@ -502,7 +421,7 @@ CREATE OR REPLACE FUNCTION "public"."aggregate_cost_invoice_summary"("p_f_text" 
           END
         )
       ), 0) AS total
-    FROM filtered_for_overdue_count f
+    FROM base f
     WHERE f.status = 'reviewed'
       AND f.paid_at IS NULL
       AND f.due_date IS NOT NULL
@@ -596,7 +515,7 @@ CREATE OR REPLACE FUNCTION "public"."aggregate_cost_invoices"("p_f_text" "text" 
     LANGUAGE "sql" STABLE SECURITY DEFINER
     SET "search_path" TO 'public'
     AS $_$
-  WITH filtered AS (
+  WITH base AS (
     SELECT ci.*
     FROM public.cost_invoices ci
     WHERE (
@@ -616,8 +535,8 @@ CREATE OR REPLACE FUNCTION "public"."aggregate_cost_invoices"("p_f_text" "text" 
         ci,
         p_f_text, p_f_description, p_f_treatment, p_f_status, p_f_doc_type, p_f_company,
         p_f_from, p_f_to, p_f_po, p_f_due_from, p_f_due_to, p_f_paid, p_f_cis,
-        p_f_project, p_f_check, p_dup_only, p_missing_due_date, p_f_credit_card,
-        p_amount_conflict_only, false, NULL::text, p_overdue_only, p_f_confidential,
+        p_f_project, p_f_check, p_dup_only, false, p_f_credit_card,
+        false, false, NULL::text, false, p_f_confidential,
         p_f_vehicle_service, p_f_vehicle_id
       )
       AND NOT EXISTS (
@@ -637,105 +556,24 @@ CREATE OR REPLACE FUNCTION "public"."aggregate_cost_invoices"("p_f_text" "text" 
         ELSE public.cost_invoice_matches_relation_filters(ci, p_f_text, p_f_description, p_f_project)
       END
   ),
-  filtered_for_missing_count AS (
-    SELECT ci.*
-    FROM public.cost_invoices ci
-    WHERE (
-        coalesce(nullif(btrim(p_f_company), ''), NULL) IS NULL
-        OR lower(ci.company_name) = lower(btrim(p_f_company))
-        OR ci.supplier_id = ANY (ARRAY(
-          SELECT cs.id
-          FROM public.cost_suppliers cs
-          WHERE coalesce(nullif(btrim(p_f_company), ''), NULL) IS NOT NULL
-            AND (
-              lower(cs.canonical_name) = lower(btrim(p_f_company))
-              OR public.company_match_key(cs.canonical_name) = public.company_match_key(p_f_company)
-            )
-        ))
-      )
-      AND public.cost_invoice_passes_scalar_filters(
-        ci,
-        p_f_text, p_f_description, p_f_treatment, p_f_status, p_f_doc_type, p_f_company,
-        p_f_from, p_f_to, p_f_po, p_f_due_from, p_f_due_to, p_f_paid, p_f_cis,
-        p_f_project, p_f_check, p_dup_only,
-        false,
-        p_f_credit_card,
-        false,
-        false,
-        NULL::text,
-        false,
-        p_f_confidential,
-        p_f_vehicle_service,
-        p_f_vehicle_id
-      )
-      AND NOT EXISTS (
-        SELECT 1
-        FROM public.invoices o
-        WHERE btrim(coalesce(ci.invoice_number, '')) ~ '^[0-9]+$'
-          AND o.invoice_number::text = btrim(ci.invoice_number)
-      )
+  filtered AS (
+    SELECT b.*
+    FROM base b
+    WHERE (NOT p_missing_due_date OR b.due_date IS NULL)
+      AND (NOT p_amount_conflict_only OR b.has_amount_conflict)
       AND (
-        coalesce(btrim(p_f_text), '') = ''
-        OR ci.search_text LIKE '%' || replace(replace(replace(lower(btrim(p_f_text)), '\', '\\'), '%', '\%'), '_', '\_') || '%' ESCAPE '\'
+        NOT p_overdue_only
+        OR (
+          b.status = 'reviewed'
+          AND b.paid_at IS NULL
+          AND b.due_date IS NOT NULL
+          AND b.due_date < current_date
+        )
       )
-      AND CASE
-        WHEN cardinality(public.parse_description_filter_terms(p_f_description)) = 0
-         AND coalesce(btrim(p_f_project), '') = ''
-        THEN true
-        ELSE public.cost_invoice_matches_relation_filters(ci, p_f_text, p_f_description, p_f_project)
-      END
-  ),
-  filtered_for_overdue_count AS (
-    SELECT ci.*
-    FROM public.cost_invoices ci
-    WHERE (
-        coalesce(nullif(btrim(p_f_company), ''), NULL) IS NULL
-        OR lower(ci.company_name) = lower(btrim(p_f_company))
-        OR ci.supplier_id = ANY (ARRAY(
-          SELECT cs.id
-          FROM public.cost_suppliers cs
-          WHERE coalesce(nullif(btrim(p_f_company), ''), NULL) IS NOT NULL
-            AND (
-              lower(cs.canonical_name) = lower(btrim(p_f_company))
-              OR public.company_match_key(cs.canonical_name) = public.company_match_key(p_f_company)
-            )
-        ))
-      )
-      AND public.cost_invoice_passes_scalar_filters(
-        ci,
-        p_f_text, p_f_description, p_f_treatment, p_f_status, p_f_doc_type, p_f_company,
-        p_f_from, p_f_to, p_f_po, p_f_due_from, p_f_due_to, p_f_paid, p_f_cis,
-        p_f_project, p_f_check, p_dup_only,
-        false,
-        p_f_credit_card,
-        false,
-        false,
-        NULL::text,
-        false,
-        p_f_confidential,
-        p_f_vehicle_service,
-        p_f_vehicle_id
-      )
-      AND NOT EXISTS (
-        SELECT 1
-        FROM public.invoices o
-        WHERE btrim(coalesce(ci.invoice_number, '')) ~ '^[0-9]+$'
-          AND o.invoice_number::text = btrim(ci.invoice_number)
-      )
-      AND (
-        coalesce(btrim(p_f_text), '') = ''
-        OR ci.search_text LIKE '%' || replace(replace(replace(lower(btrim(p_f_text)), '\', '\\'), '%', '\%'), '_', '\_') || '%' ESCAPE '\'
-      )
-      AND CASE
-        WHEN cardinality(public.parse_description_filter_terms(p_f_description)) = 0
-         AND coalesce(btrim(p_f_project), '') = ''
-        THEN true
-        ELSE public.cost_invoice_matches_relation_filters(ci, p_f_text, p_f_description, p_f_project)
-      END
   ),
   missing_due_date_count AS (
     SELECT count(*)::bigint AS cnt
-    FROM filtered_for_missing_count f
+    FROM base f
     WHERE f.due_date IS NULL
   ),
   overdue_stats AS (
@@ -752,7 +590,7 @@ CREATE OR REPLACE FUNCTION "public"."aggregate_cost_invoices"("p_f_text" "text" 
           END
         )
       ), 0) AS total
-    FROM filtered_for_overdue_count f
+    FROM base f
     WHERE f.status = 'reviewed'
       AND f.paid_at IS NULL
       AND f.due_date IS NOT NULL
@@ -4874,7 +4712,10 @@ CREATE OR REPLACE FUNCTION "public"."list_cost_invoices"("p_f_text" "text" DEFAU
     SET "search_path" TO 'public'
     AS $_$
   WITH filtered AS (
-    SELECT ci.*
+    SELECT
+      ci.id,
+      ci.created_at,
+      public.cost_invoice_sort_value(ci, p_sort_key) AS sort_value
     FROM public.cost_invoices ci
     WHERE (
         coalesce(nullif(btrim(p_f_company), ''), NULL) IS NULL
@@ -4921,17 +4762,10 @@ CREATE OR REPLACE FUNCTION "public"."list_cost_invoices"("p_f_text" "text" DEFAU
         ELSE (SELECT count(*)::bigint FROM filtered)
       END AS cnt
   ),
-  ranked AS (
-    SELECT
-      f.*,
-      t.cnt AS total_count,
-      public.cost_invoice_sort_value(f, p_sort_key) AS sort_value
+  page AS (
+    SELECT f.id, f.created_at, f.sort_value, t.cnt AS total_count
     FROM filtered f
     CROSS JOIN total t
-  ),
-  ordered AS (
-    SELECT r.*
-    FROM ranked r
     WHERE (
       p_cursor_sort_value IS NULL
       AND p_cursor_id IS NULL
@@ -4941,99 +4775,100 @@ CREATE OR REPLACE FUNCTION "public"."list_cost_invoices"("p_f_text" "text" DEFAU
     OR (
       p_sort_dir = 'desc'
       AND (
-        r.sort_value < p_cursor_sort_value
-        OR (r.sort_value IS NOT DISTINCT FROM p_cursor_sort_value AND r.id > p_cursor_id)
-        OR (r.sort_value IS NULL AND p_cursor_sort_value IS NOT NULL)
-        OR (r.sort_value IS NULL AND p_cursor_sort_value IS NULL AND r.id > p_cursor_id)
+        f.sort_value < p_cursor_sort_value
+        OR (f.sort_value IS NOT DISTINCT FROM p_cursor_sort_value AND f.id > p_cursor_id)
+        OR (f.sort_value IS NULL AND p_cursor_sort_value IS NOT NULL)
+        OR (f.sort_value IS NULL AND p_cursor_sort_value IS NULL AND f.id > p_cursor_id)
       )
     )
     OR (
       p_sort_dir = 'asc'
       AND (
-        r.sort_value > p_cursor_sort_value
-        OR (r.sort_value IS NOT DISTINCT FROM p_cursor_sort_value AND r.id > p_cursor_id)
-        OR (r.sort_value IS NOT NULL AND p_cursor_sort_value IS NULL)
-        OR (r.sort_value IS NULL AND p_cursor_sort_value IS NULL AND r.id > p_cursor_id)
+        f.sort_value > p_cursor_sort_value
+        OR (f.sort_value IS NOT DISTINCT FROM p_cursor_sort_value AND f.id > p_cursor_id)
+        OR (f.sort_value IS NOT NULL AND p_cursor_sort_value IS NULL)
+        OR (f.sort_value IS NULL AND p_cursor_sort_value IS NULL AND f.id > p_cursor_id)
       )
     )
     ORDER BY
-      CASE WHEN r.sort_value IS NULL THEN 1 ELSE 0 END,
-      CASE WHEN p_sort_dir = 'asc' THEN r.sort_value END ASC NULLS LAST,
-      CASE WHEN p_sort_dir = 'desc' THEN r.sort_value END DESC NULLS LAST,
-      CASE WHEN p_sort_key = 'received' THEN r.created_at END DESC NULLS LAST,
-      r.id ASC
+      CASE WHEN f.sort_value IS NULL THEN 1 ELSE 0 END,
+      CASE WHEN p_sort_dir = 'asc' THEN f.sort_value END ASC NULLS LAST,
+      CASE WHEN p_sort_dir = 'desc' THEN f.sort_value END DESC NULLS LAST,
+      CASE WHEN p_sort_key = 'received' THEN f.created_at END DESC NULLS LAST,
+      f.id ASC
+    LIMIT CASE WHEN p_unpaginated THEN NULL ELSE p_limit END
+    OFFSET CASE WHEN p_unpaginated OR p_cursor_id IS NOT NULL THEN 0 ELSE p_offset END
   )
   SELECT
-    o.id,
-    o.status,
-    o.company_name,
-    o.company_name_raw,
-    o.invoice_number,
-    o.po_reference,
-    o.invoice_date,
-    o.due_date,
-    o.due_date_rule,
-    o.description,
-    o.currency,
-    o.net_amount,
-    o.vat_amount,
-    o.total_amount,
-    o.vat_treatment,
-    o.nas_path,
-    o.nas_fallback_path,
-    o.attachment_filename,
-    o.attachment_sha256,
-    o.source_email_from,
-    o.source_subject,
-    o.source_message_id,
-    o.source_received_at,
-    o.gemini_confidence,
-    o.is_duplicate,
-    o.duplicate_of,
-    o.has_duplicate_siblings,
-    o.has_amount_conflict,
-    o.pending_amount_conflict,
-    o.linked_documents,
-    o.notes,
-    o.created_at,
-    o.updated_at,
-    o.paid_at,
-    o.paid_by_credit_card,
-    o.is_confidential,
-    o.is_vehicle_service,
-    o.vehicle_id,
+    ci.id,
+    ci.status,
+    ci.company_name,
+    ci.company_name_raw,
+    ci.invoice_number,
+    ci.po_reference,
+    ci.invoice_date,
+    ci.due_date,
+    ci.due_date_rule,
+    ci.description,
+    ci.currency,
+    ci.net_amount,
+    ci.vat_amount,
+    ci.total_amount,
+    ci.vat_treatment,
+    ci.nas_path,
+    ci.nas_fallback_path,
+    ci.attachment_filename,
+    ci.attachment_sha256,
+    ci.source_email_from,
+    ci.source_subject,
+    ci.source_message_id,
+    ci.source_received_at,
+    ci.gemini_confidence,
+    ci.is_duplicate,
+    ci.duplicate_of,
+    ci.has_duplicate_siblings,
+    ci.has_amount_conflict,
+    ci.pending_amount_conflict,
+    ci.linked_documents,
+    ci.notes,
+    ci.created_at,
+    ci.updated_at,
+    ci.paid_at,
+    ci.paid_by_credit_card,
+    ci.is_confidential,
+    ci.is_vehicle_service,
+    ci.vehicle_id,
     v.registration AS vehicle_registration,
-    o.vehicle_registration_extracted,
-    o.source_account_id,
-    o.cis_amount,
-    o.document_type,
-    o.project_id,
-    o.project_other,
-    o.is_overhead,
-    o.subcontractor_id,
-    o.timesheet_check_status,
-    o.timesheet_check_at,
-    o.timesheet_check_detail,
-    o.company_invoice_key,
-    o.invoice_number_key,
-    o.invoice_format_key,
-    o.supplier_email_domain,
-    o.supplier_id,
-    o.supplier_vat_number,
-    o.supplier_company_reg_number,
-    o.payment_reminded_at,
-    o.full_field_dedupe_key,
-    o.total_count
-  FROM ordered o
-  LEFT JOIN public.vehicles v ON v.id = o.vehicle_id
+    ci.vehicle_registration_extracted,
+    ci.source_account_id,
+    ci.cis_amount,
+    ci.document_type,
+    ci.project_id,
+    ci.project_other,
+    ci.is_overhead,
+    ci.subcontractor_id,
+    ci.timesheet_check_status,
+    ci.timesheet_check_at,
+    ci.timesheet_check_detail,
+    ci.company_invoice_key,
+    ci.invoice_number_key,
+    ci.invoice_format_key,
+    ci.supplier_email_domain,
+    ci.supplier_id,
+    ci.supplier_vat_number,
+    ci.supplier_company_reg_number,
+    ci.payment_reminded_at,
+    ci.full_field_dedupe_key,
+    p.total_count
+  FROM page p
+  JOIN public.cost_invoices ci ON ci.id = p.id
+  LEFT JOIN public.vehicles v ON v.id = ci.vehicle_id
   ORDER BY
-    CASE WHEN o.sort_value IS NULL THEN 1 ELSE 0 END,
-    CASE WHEN p_sort_dir = 'asc' THEN o.sort_value END ASC NULLS LAST,
-    CASE WHEN p_sort_dir = 'desc' THEN o.sort_value END DESC NULLS LAST,
-    CASE WHEN p_sort_key = 'received' THEN o.created_at END DESC NULLS LAST,
-    o.id ASC
-  LIMIT CASE WHEN p_unpaginated THEN NULL ELSE p_limit END
-  OFFSET CASE WHEN p_unpaginated OR p_cursor_id IS NOT NULL THEN 0 ELSE p_offset END;
+    CASE WHEN p.sort_value IS NULL THEN 1 ELSE 0 END,
+    CASE WHEN p_sort_dir = 'asc' THEN p.sort_value END ASC NULLS LAST,
+    CASE WHEN p_sort_dir = 'desc' THEN p.sort_value END DESC NULLS LAST,
+    CASE WHEN p_sort_key = 'received' THEN p.created_at END DESC NULLS LAST,
+    p.id ASC;
 $_$;
 
 
@@ -10456,7 +10291,15 @@ CREATE INDEX "cost_invoices_vehicle_hire_idx" ON "public"."cost_invoices" USING 
 
 
 
+CREATE INDEX "cost_invoices_vehicle_hire_true_idx" ON "public"."cost_invoices" USING "btree" ("id") WHERE "is_vehicle_hire";
+
+
+
 CREATE INDEX "cost_invoices_vehicle_id_idx" ON "public"."cost_invoices" USING "btree" ("vehicle_id") WHERE ("vehicle_id" IS NOT NULL);
+
+
+
+CREATE INDEX "cost_invoices_vehicle_purchase_true_idx" ON "public"."cost_invoices" USING "btree" ("id") WHERE "is_vehicle_purchase";
 
 
 
