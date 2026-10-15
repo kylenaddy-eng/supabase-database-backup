@@ -2388,6 +2388,34 @@ $$;
 ALTER FUNCTION "public"."can_write_timesheet_pending_amendment"("_timesheet_id" "uuid") OWNER TO "postgres";
 
 
+CREATE OR REPLACE FUNCTION "public"."chat_thread_visible"("p_thread_key" "text") RETURNS boolean
+    LANGUAGE "sql" STABLE
+    SET "search_path" TO 'public'
+    AS $_$
+  SELECT CASE
+    WHEN p_thread_key ~* '^p:[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$' THEN
+      EXISTS (
+        SELECT 1
+        FROM public.projects p
+        WHERE p.id = substring(p_thread_key from 3)::uuid
+      )
+    WHEN p_thread_key ~* '^r:[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}:[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$' THEN
+      EXISTS (
+        SELECT 1
+        FROM public.projects p
+        WHERE p.id = substring(p_thread_key from 3 for 36)::uuid
+      )
+    WHEN p_thread_key ~* '^d:[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}:[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$' THEN
+      substring(p_thread_key from 3 for 36)::uuid = auth.uid()
+      OR substring(p_thread_key from 40 for 36)::uuid = auth.uid()
+    ELSE false
+  END;
+$_$;
+
+
+ALTER FUNCTION "public"."chat_thread_visible"("p_thread_key" "text") OWNER TO "postgres";
+
+
 CREATE OR REPLACE FUNCTION "public"."company_match_key"("p_name" "text") RETURNS "text"
     LANGUAGE "sql" IMMUTABLE
     SET "search_path" TO 'public'
@@ -8251,6 +8279,47 @@ CREATE TABLE IF NOT EXISTS "public"."audit_log" (
 ALTER TABLE "public"."audit_log" OWNER TO "postgres";
 
 
+CREATE TABLE IF NOT EXISTS "public"."chat_message_reads" (
+    "user_id" "uuid" NOT NULL,
+    "thread_key" "text" NOT NULL,
+    "message_id" "text" NOT NULL,
+    "read_at" timestamp with time zone DEFAULT "now"() NOT NULL,
+    CONSTRAINT "chat_message_reads_message_id_chk" CHECK (("message_id" ~* '^[0-9]{8}T[0-9]{9}-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'::"text")),
+    CONSTRAINT "chat_message_reads_thread_key_chk" CHECK (("thread_key" ~* '^(p:[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}|r:[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}:[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}|d:[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}:[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$'::"text"))
+);
+
+ALTER TABLE ONLY "public"."chat_message_reads" REPLICA IDENTITY FULL;
+
+
+ALTER TABLE "public"."chat_message_reads" OWNER TO "postgres";
+
+
+CREATE TABLE IF NOT EXISTS "public"."chat_read_cursors" (
+    "user_id" "uuid" NOT NULL,
+    "thread_key" "text" NOT NULL,
+    "last_read_message_id" "text" NOT NULL,
+    "updated_at" timestamp with time zone DEFAULT "now"() NOT NULL,
+    CONSTRAINT "chat_read_cursors_thread_key_chk" CHECK (("thread_key" ~* '^(p:[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}|r:[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}:[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}|d:[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}:[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$'::"text"))
+);
+
+
+ALTER TABLE "public"."chat_read_cursors" OWNER TO "postgres";
+
+
+CREATE TABLE IF NOT EXISTS "public"."chat_thread_signals" (
+    "thread_key" "text" NOT NULL,
+    "message_id" "text" NOT NULL,
+    "updated_at" timestamp with time zone DEFAULT "now"() NOT NULL,
+    CONSTRAINT "chat_thread_signals_message_id_chk" CHECK (("message_id" ~* '^[0-9]{8}T[0-9]{9}-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'::"text")),
+    CONSTRAINT "chat_thread_signals_thread_key_chk" CHECK (("thread_key" ~* '^(p:[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}|r:[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}:[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}|d:[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}:[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$'::"text"))
+);
+
+ALTER TABLE ONLY "public"."chat_thread_signals" REPLICA IDENTITY FULL;
+
+
+ALTER TABLE "public"."chat_thread_signals" OWNER TO "postgres";
+
+
 CREATE TABLE IF NOT EXISTS "public"."clients" (
     "id" "uuid" DEFAULT "gen_random_uuid"() NOT NULL,
     "name" "text" NOT NULL,
@@ -8965,7 +9034,8 @@ CREATE TABLE IF NOT EXISTS "public"."notification_preferences" (
     "vehicle_service_due" boolean DEFAULT true NOT NULL,
     "user_management" boolean DEFAULT true NOT NULL,
     "team_member_changes" boolean DEFAULT true NOT NULL,
-    "cost_payment_made" boolean DEFAULT true NOT NULL
+    "cost_payment_made" boolean DEFAULT true NOT NULL,
+    "project_chat" boolean DEFAULT true NOT NULL
 );
 
 
@@ -9100,6 +9170,17 @@ CREATE TABLE IF NOT EXISTS "public"."project_assignments" (
 
 
 ALTER TABLE "public"."project_assignments" OWNER TO "postgres";
+
+
+CREATE TABLE IF NOT EXISTS "public"."project_chat_cursors" (
+    "user_id" "uuid" NOT NULL,
+    "project_id" "uuid" NOT NULL,
+    "last_read_message_id" "text" NOT NULL,
+    "updated_at" timestamp with time zone DEFAULT "now"() NOT NULL
+);
+
+
+ALTER TABLE "public"."project_chat_cursors" OWNER TO "postgres";
 
 
 CREATE TABLE IF NOT EXISTS "public"."projects" (
@@ -9670,6 +9751,21 @@ ALTER TABLE ONLY "public"."audit_log"
 
 
 
+ALTER TABLE ONLY "public"."chat_message_reads"
+    ADD CONSTRAINT "chat_message_reads_pkey" PRIMARY KEY ("user_id", "thread_key", "message_id");
+
+
+
+ALTER TABLE ONLY "public"."chat_read_cursors"
+    ADD CONSTRAINT "chat_read_cursors_pkey" PRIMARY KEY ("user_id", "thread_key");
+
+
+
+ALTER TABLE ONLY "public"."chat_thread_signals"
+    ADD CONSTRAINT "chat_thread_signals_pkey" PRIMARY KEY ("thread_key");
+
+
+
 ALTER TABLE ONLY "public"."clients"
     ADD CONSTRAINT "clients_name_key" UNIQUE ("name");
 
@@ -9965,6 +10061,11 @@ ALTER TABLE ONLY "public"."project_assignments"
 
 
 
+ALTER TABLE ONLY "public"."project_chat_cursors"
+    ADD CONSTRAINT "project_chat_cursors_pkey" PRIMARY KEY ("user_id", "project_id");
+
+
+
 ALTER TABLE ONLY "public"."projects"
     ADD CONSTRAINT "projects_client_id_code_key" UNIQUE ("client_id", "code");
 
@@ -10188,6 +10289,10 @@ CREATE INDEX "audit_log_entity_idx" ON "public"."audit_log" USING "btree" ("enti
 
 
 CREATE INDEX "audit_log_parent_idx" ON "public"."audit_log" USING "btree" ("parent_type", "parent_id");
+
+
+
+CREATE INDEX "chat_message_reads_thread_idx" ON "public"."chat_message_reads" USING "btree" ("thread_key");
 
 
 
@@ -10964,6 +11069,16 @@ ALTER TABLE ONLY "public"."audit_log"
 
 
 
+ALTER TABLE ONLY "public"."chat_message_reads"
+    ADD CONSTRAINT "chat_message_reads_user_id_fkey" FOREIGN KEY ("user_id") REFERENCES "auth"."users"("id") ON DELETE CASCADE;
+
+
+
+ALTER TABLE ONLY "public"."chat_read_cursors"
+    ADD CONSTRAINT "chat_read_cursors_user_id_fkey" FOREIGN KEY ("user_id") REFERENCES "auth"."users"("id") ON DELETE CASCADE;
+
+
+
 ALTER TABLE ONLY "public"."cost_company_subcontractors"
     ADD CONSTRAINT "cost_company_subcontractors_subcontractor_id_fkey" FOREIGN KEY ("subcontractor_id") REFERENCES "public"."subcontractors"("id") ON DELETE CASCADE;
 
@@ -11241,6 +11356,16 @@ ALTER TABLE ONLY "public"."project_assignments"
 
 ALTER TABLE ONLY "public"."project_assignments"
     ADD CONSTRAINT "project_assignments_user_id_fkey" FOREIGN KEY ("user_id") REFERENCES "auth"."users"("id") ON DELETE CASCADE;
+
+
+
+ALTER TABLE ONLY "public"."project_chat_cursors"
+    ADD CONSTRAINT "project_chat_cursors_project_id_fkey" FOREIGN KEY ("project_id") REFERENCES "public"."projects"("id") ON DELETE CASCADE;
+
+
+
+ALTER TABLE ONLY "public"."project_chat_cursors"
+    ADD CONSTRAINT "project_chat_cursors_user_id_fkey" FOREIGN KEY ("user_id") REFERENCES "auth"."users"("id") ON DELETE CASCADE;
 
 
 
@@ -11770,6 +11895,47 @@ CREATE POLICY "audit_log read with permission" ON "public"."audit_log" FOR SELEC
 
 
 
+CREATE POLICY "chat message reads insert own" ON "public"."chat_message_reads" FOR INSERT TO "authenticated" WITH CHECK ((("user_id" = "auth"."uid"()) AND "public"."chat_thread_visible"("thread_key")));
+
+
+
+CREATE POLICY "chat message reads select" ON "public"."chat_message_reads" FOR SELECT TO "authenticated" USING ("public"."chat_thread_visible"("thread_key"));
+
+
+
+CREATE POLICY "chat read cursors insert own" ON "public"."chat_read_cursors" FOR INSERT TO "authenticated" WITH CHECK ((("user_id" = "auth"."uid"()) AND "public"."chat_thread_visible"("thread_key")));
+
+
+
+CREATE POLICY "chat read cursors select" ON "public"."chat_read_cursors" FOR SELECT TO "authenticated" USING ("public"."chat_thread_visible"("thread_key"));
+
+
+
+CREATE POLICY "chat read cursors update own" ON "public"."chat_read_cursors" FOR UPDATE TO "authenticated" USING (("user_id" = "auth"."uid"())) WITH CHECK ((("user_id" = "auth"."uid"()) AND "public"."chat_thread_visible"("thread_key")));
+
+
+
+CREATE POLICY "chat thread signals insert" ON "public"."chat_thread_signals" FOR INSERT TO "authenticated" WITH CHECK ("public"."chat_thread_visible"("thread_key"));
+
+
+
+CREATE POLICY "chat thread signals select" ON "public"."chat_thread_signals" FOR SELECT TO "authenticated" USING ("public"."chat_thread_visible"("thread_key"));
+
+
+
+CREATE POLICY "chat thread signals update" ON "public"."chat_thread_signals" FOR UPDATE TO "authenticated" USING ("public"."chat_thread_visible"("thread_key")) WITH CHECK ("public"."chat_thread_visible"("thread_key"));
+
+
+
+ALTER TABLE "public"."chat_message_reads" ENABLE ROW LEVEL SECURITY;
+
+
+ALTER TABLE "public"."chat_read_cursors" ENABLE ROW LEVEL SECURITY;
+
+
+ALTER TABLE "public"."chat_thread_signals" ENABLE ROW LEVEL SECURITY;
+
+
 ALTER TABLE "public"."clients" ENABLE ROW LEVEL SECURITY;
 
 
@@ -12153,7 +12319,28 @@ CREATE POLICY "profiles self update" ON "public"."profiles" FOR UPDATE TO "authe
 
 
 
+CREATE POLICY "project chat cursors insert own" ON "public"."project_chat_cursors" FOR INSERT TO "authenticated" WITH CHECK ((("user_id" = "auth"."uid"()) AND (EXISTS ( SELECT 1
+   FROM "public"."projects" "p"
+  WHERE ("p"."id" = "project_chat_cursors"."project_id")))));
+
+
+
+CREATE POLICY "project chat cursors read" ON "public"."project_chat_cursors" FOR SELECT TO "authenticated" USING ((EXISTS ( SELECT 1
+   FROM "public"."projects" "p"
+  WHERE ("p"."id" = "project_chat_cursors"."project_id"))));
+
+
+
+CREATE POLICY "project chat cursors update own" ON "public"."project_chat_cursors" FOR UPDATE TO "authenticated" USING (("user_id" = "auth"."uid"())) WITH CHECK ((("user_id" = "auth"."uid"()) AND (EXISTS ( SELECT 1
+   FROM "public"."projects" "p"
+  WHERE ("p"."id" = "project_chat_cursors"."project_id")))));
+
+
+
 ALTER TABLE "public"."project_assignments" ENABLE ROW LEVEL SECURITY;
+
+
+ALTER TABLE "public"."project_chat_cursors" ENABLE ROW LEVEL SECURITY;
 
 
 ALTER TABLE "public"."projects" ENABLE ROW LEVEL SECURITY;
@@ -12698,6 +12885,14 @@ ALTER PUBLICATION "supabase_realtime" OWNER TO "postgres";
 
 
 
+
+
+
+ALTER PUBLICATION "supabase_realtime" ADD TABLE ONLY "public"."chat_message_reads";
+
+
+
+ALTER PUBLICATION "supabase_realtime" ADD TABLE ONLY "public"."chat_thread_signals";
 
 
 
@@ -13331,6 +13526,13 @@ GRANT ALL ON FUNCTION "public"."can_view_timesheet_pending_amendment"("_timeshee
 REVOKE ALL ON FUNCTION "public"."can_write_timesheet_pending_amendment"("_timesheet_id" "uuid") FROM PUBLIC;
 GRANT ALL ON FUNCTION "public"."can_write_timesheet_pending_amendment"("_timesheet_id" "uuid") TO "authenticated";
 GRANT ALL ON FUNCTION "public"."can_write_timesheet_pending_amendment"("_timesheet_id" "uuid") TO "service_role";
+
+
+
+REVOKE ALL ON FUNCTION "public"."chat_thread_visible"("p_thread_key" "text") FROM PUBLIC;
+GRANT ALL ON FUNCTION "public"."chat_thread_visible"("p_thread_key" "text") TO "anon";
+GRANT ALL ON FUNCTION "public"."chat_thread_visible"("p_thread_key" "text") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."chat_thread_visible"("p_thread_key" "text") TO "service_role";
 
 
 
@@ -14151,6 +14353,24 @@ GRANT ALL ON TABLE "public"."audit_log" TO "service_role";
 
 
 
+GRANT ALL ON TABLE "public"."chat_message_reads" TO "anon";
+GRANT ALL ON TABLE "public"."chat_message_reads" TO "authenticated";
+GRANT ALL ON TABLE "public"."chat_message_reads" TO "service_role";
+
+
+
+GRANT ALL ON TABLE "public"."chat_read_cursors" TO "anon";
+GRANT ALL ON TABLE "public"."chat_read_cursors" TO "authenticated";
+GRANT ALL ON TABLE "public"."chat_read_cursors" TO "service_role";
+
+
+
+GRANT ALL ON TABLE "public"."chat_thread_signals" TO "anon";
+GRANT ALL ON TABLE "public"."chat_thread_signals" TO "authenticated";
+GRANT ALL ON TABLE "public"."chat_thread_signals" TO "service_role";
+
+
+
 GRANT ALL ON TABLE "public"."clients" TO "anon";
 GRANT ALL ON TABLE "public"."clients" TO "authenticated";
 GRANT ALL ON TABLE "public"."clients" TO "service_role";
@@ -14477,6 +14697,12 @@ GRANT SELECT("archived_at") ON TABLE "public"."profiles" TO "authenticated";
 GRANT ALL ON TABLE "public"."project_assignments" TO "anon";
 GRANT ALL ON TABLE "public"."project_assignments" TO "authenticated";
 GRANT ALL ON TABLE "public"."project_assignments" TO "service_role";
+
+
+
+GRANT ALL ON TABLE "public"."project_chat_cursors" TO "anon";
+GRANT ALL ON TABLE "public"."project_chat_cursors" TO "authenticated";
+GRANT ALL ON TABLE "public"."project_chat_cursors" TO "service_role";
 
 
 
