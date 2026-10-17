@@ -156,6 +156,46 @@ CREATE TYPE "public"."submission_status" AS ENUM (
 ALTER TYPE "public"."submission_status" OWNER TO "postgres";
 
 
+CREATE OR REPLACE FUNCTION "public"."add_chat_group_members"("p_group_id" "uuid", "p_member_ids" "uuid"[]) RETURNS "void"
+    LANGUAGE "plpgsql" SECURITY DEFINER
+    SET "search_path" TO 'public'
+    AS $$
+BEGIN
+  IF auth.uid() IS NULL OR NOT public.is_chat_group_admin(p_group_id) THEN
+    RAISE EXCEPTION 'Chat not found';
+  END IF;
+  IF p_member_ids IS NULL OR NOT EXISTS (
+    SELECT 1 FROM unnest(p_member_ids) AS picked(user_id) WHERE picked.user_id IS DISTINCT FROM auth.uid()
+  ) THEN
+    RAISE EXCEPTION 'Choose at least one person';
+  END IF;
+  IF EXISTS (
+    SELECT 1
+    FROM unnest(p_member_ids) AS picked(user_id)
+    WHERE picked.user_id IS DISTINCT FROM auth.uid()
+      AND NOT EXISTS (
+        SELECT 1
+        FROM public.profiles p
+        WHERE p.id = picked.user_id
+          AND p.active
+          AND p.archived_at IS NULL
+      )
+  ) THEN
+    RAISE EXCEPTION 'Choose people who can sign in';
+  END IF;
+
+  INSERT INTO public.chat_group_members (group_id, user_id, role)
+  SELECT DISTINCT p_group_id, picked.user_id, 'member'
+  FROM unnest(p_member_ids) AS picked(user_id)
+  WHERE picked.user_id IS DISTINCT FROM auth.uid()
+  ON CONFLICT (group_id, user_id) DO NOTHING;
+END;
+$$;
+
+
+ALTER FUNCTION "public"."add_chat_group_members"("p_group_id" "uuid", "p_member_ids" "uuid"[]) OWNER TO "postgres";
+
+
 CREATE OR REPLACE FUNCTION "public"."admin_set_vault_secret"("p_name" "text", "p_value" "text") RETURNS "void"
     LANGUAGE "plpgsql" SECURITY DEFINER
     SET "search_path" TO 'public'
@@ -960,6 +1000,28 @@ $$;
 
 
 ALTER FUNCTION "public"."assert_rpc_submissions_browser"("p_worker_id" "uuid", "p_allowed_worker_ids" "uuid"[]) OWNER TO "postgres";
+
+
+CREATE OR REPLACE FUNCTION "public"."assign_privileged_project_members"() RETURNS "trigger"
+    LANGUAGE "plpgsql" SECURITY DEFINER
+    SET "search_path" TO 'public'
+    AS $$
+BEGIN
+  INSERT INTO public.project_assignments (project_id, user_id, assigned_by)
+  SELECT NEW.id, picked.user_id, NULL
+  FROM (
+    SELECT DISTINCT ur.user_id
+    FROM public.user_roles ur
+    WHERE ur.role IN ('admin', 'super_admin', 'cost_admin')
+  ) AS picked
+  ON CONFLICT (project_id, user_id) DO NOTHING;
+
+  RETURN NEW;
+END;
+$$;
+
+
+ALTER FUNCTION "public"."assign_privileged_project_members"() OWNER TO "postgres";
 
 
 CREATE OR REPLACE FUNCTION "public"."audit_build_summary"("p_table" "text", "p_action" "text", "p_new" "anyelement", "p_old" "anyelement", "p_changes" "jsonb") RETURNS "text"
@@ -2399,15 +2461,25 @@ CREATE OR REPLACE FUNCTION "public"."chat_thread_visible"("p_thread_key" "text")
         FROM public.projects p
         WHERE p.id = substring(p_thread_key from 3)::uuid
       )
+      AND (
+        public.is_assigned_to_project(auth.uid(), substring(p_thread_key from 3)::uuid)
+        OR public.has_role(auth.uid(), 'admin')
+      )
     WHEN p_thread_key ~* '^r:[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}:[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$' THEN
       EXISTS (
         SELECT 1
         FROM public.projects p
         WHERE p.id = substring(p_thread_key from 3 for 36)::uuid
       )
+      AND (
+        public.is_assigned_to_project(auth.uid(), substring(p_thread_key from 3 for 36)::uuid)
+        OR public.has_role(auth.uid(), 'admin')
+      )
     WHEN p_thread_key ~* '^d:[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}:[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$' THEN
       substring(p_thread_key from 3 for 36)::uuid = auth.uid()
       OR substring(p_thread_key from 40 for 36)::uuid = auth.uid()
+    WHEN p_thread_key ~* '^g:[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$' THEN
+      public.is_chat_group_member(substring(p_thread_key from 3)::uuid)
     ELSE false
   END;
 $_$;
@@ -3559,6 +3631,78 @@ $_$;
 ALTER FUNCTION "public"."create_app_role"("_slug" "text", "_label" "text", "_description" "text", "_clone_from" "text") OWNER TO "postgres";
 
 
+CREATE OR REPLACE FUNCTION "public"."create_chat_group"("p_name" "text", "p_member_ids" "uuid"[]) RETURNS "uuid"
+    LANGUAGE "plpgsql" SECURITY DEFINER
+    SET "search_path" TO 'public'
+    AS $$
+DECLARE
+  _me uuid := auth.uid();
+  _name text;
+  _id uuid;
+BEGIN
+  IF _me IS NULL THEN
+    RAISE EXCEPTION 'Not signed in';
+  END IF;
+  IF NOT (
+    public.has_role(_me, 'admin')
+    OR public.has_role(_me, 'internal_manager')
+    OR public.has_role(_me, 'cost_admin')
+    OR public.has_role(_me, 'super_admin')
+  ) THEN
+    RAISE EXCEPTION 'You cannot start new chats';
+  END IF;
+  _name := regexp_replace(btrim(coalesce(p_name, '')), '\s+', ' ', 'g');
+  IF _name = '' THEN
+    RAISE EXCEPTION 'Name the group';
+  END IF;
+  IF char_length(_name) > 80 THEN
+    RAISE EXCEPTION 'Group name is too long';
+  END IF;
+  IF p_member_ids IS NULL OR NOT EXISTS (
+    SELECT 1 FROM unnest(p_member_ids) AS picked(user_id) WHERE picked.user_id IS DISTINCT FROM _me
+  ) THEN
+    RAISE EXCEPTION 'Choose at least one person';
+  END IF;
+  IF (
+    SELECT count(DISTINCT picked.user_id) FROM unnest(p_member_ids) AS picked(user_id) WHERE picked.user_id IS DISTINCT FROM _me
+  ) > 100 THEN
+    RAISE EXCEPTION 'Choose up to 100 people';
+  END IF;
+  IF EXISTS (
+    SELECT 1
+    FROM unnest(p_member_ids) AS picked(user_id)
+    WHERE picked.user_id IS DISTINCT FROM _me
+      AND NOT EXISTS (
+        SELECT 1
+        FROM public.profiles p
+        WHERE p.id = picked.user_id
+          AND p.active
+          AND p.archived_at IS NULL
+      )
+  ) THEN
+    RAISE EXCEPTION 'Choose people who can sign in';
+  END IF;
+
+  INSERT INTO public.chat_groups (name, created_by)
+  VALUES (_name, _me)
+  RETURNING id INTO _id;
+
+  INSERT INTO public.chat_group_members (group_id, user_id, role)
+  VALUES (_id, _me, 'admin');
+
+  INSERT INTO public.chat_group_members (group_id, user_id, role)
+  SELECT DISTINCT _id, picked.user_id, 'member'
+  FROM unnest(p_member_ids) AS picked(user_id)
+  WHERE picked.user_id IS DISTINCT FROM _me;
+
+  RETURN _id;
+END;
+$$;
+
+
+ALTER FUNCTION "public"."create_chat_group"("p_name" "text", "p_member_ids" "uuid"[]) OWNER TO "postgres";
+
+
 CREATE OR REPLACE FUNCTION "public"."daily_briefing_autoapprove"() RETURNS "trigger"
     LANGUAGE "plpgsql" SECURITY DEFINER
     SET "search_path" TO 'public'
@@ -3590,6 +3734,25 @@ $$;
 
 
 ALTER FUNCTION "public"."delete_app_role"("_slug" "text") OWNER TO "postgres";
+
+
+CREATE OR REPLACE FUNCTION "public"."delete_chat_group"("p_group_id" "uuid") RETURNS "void"
+    LANGUAGE "plpgsql" SECURITY DEFINER
+    SET "search_path" TO 'public'
+    AS $$
+BEGIN
+  IF auth.uid() IS NULL OR NOT public.has_role(auth.uid(), 'admin') THEN
+    RAISE EXCEPTION 'You cannot delete this chat';
+  END IF;
+  IF NOT EXISTS (SELECT 1 FROM public.chat_groups WHERE id = p_group_id) THEN
+    RAISE EXCEPTION 'Chat not found';
+  END IF;
+  DELETE FROM public.chat_groups WHERE id = p_group_id;
+END;
+$$;
+
+
+ALTER FUNCTION "public"."delete_chat_group"("p_group_id" "uuid") OWNER TO "postgres";
 
 
 CREATE OR REPLACE FUNCTION "public"."delete_cost_payment_remittances_for_invoices"("p_invoice_ids" "uuid"[]) RETURNS integer
@@ -4377,6 +4540,39 @@ $$;
 ALTER FUNCTION "public"."is_assigned_to_todo_list"("_user_id" "uuid", "_list_id" "uuid") OWNER TO "postgres";
 
 
+CREATE OR REPLACE FUNCTION "public"."is_chat_group_admin"("p_group_id" "uuid") RETURNS boolean
+    LANGUAGE "sql" STABLE SECURITY DEFINER
+    SET "search_path" TO 'public'
+    AS $$
+  SELECT EXISTS (
+    SELECT 1
+    FROM public.chat_group_members
+    WHERE group_id = p_group_id
+      AND user_id = auth.uid()
+      AND role = 'admin'
+  );
+$$;
+
+
+ALTER FUNCTION "public"."is_chat_group_admin"("p_group_id" "uuid") OWNER TO "postgres";
+
+
+CREATE OR REPLACE FUNCTION "public"."is_chat_group_member"("p_group_id" "uuid") RETURNS boolean
+    LANGUAGE "sql" STABLE SECURITY DEFINER
+    SET "search_path" TO 'public'
+    AS $$
+  SELECT EXISTS (
+    SELECT 1
+    FROM public.chat_group_members
+    WHERE group_id = p_group_id
+      AND user_id = auth.uid()
+  );
+$$;
+
+
+ALTER FUNCTION "public"."is_chat_group_member"("p_group_id" "uuid") OWNER TO "postgres";
+
+
 CREATE OR REPLACE FUNCTION "public"."is_generic_email_domain"("p_domain" "text") RETURNS boolean
     LANGUAGE "sql" IMMUTABLE
     SET "search_path" TO 'public'
@@ -4484,6 +4680,63 @@ $$;
 
 
 ALTER FUNCTION "public"."is_staff_relay_domain"("p_domain" "text") OWNER TO "postgres";
+
+
+CREATE OR REPLACE FUNCTION "public"."leave_chat_group"("p_group_id" "uuid") RETURNS "void"
+    LANGUAGE "plpgsql" SECURITY DEFINER
+    SET "search_path" TO 'public'
+    AS $$
+DECLARE
+  _me uuid := auth.uid();
+  _role text;
+  _next uuid;
+BEGIN
+  IF _me IS NULL THEN
+    RAISE EXCEPTION 'Not signed in';
+  END IF;
+  SELECT role INTO _role
+  FROM public.chat_group_members
+  WHERE group_id = p_group_id
+    AND user_id = _me;
+  IF _role IS NULL THEN
+    RAISE EXCEPTION 'Chat not found';
+  END IF;
+
+  IF _role = 'admin' AND NOT EXISTS (
+    SELECT 1
+    FROM public.chat_group_members
+    WHERE group_id = p_group_id
+      AND user_id <> _me
+      AND role = 'admin'
+  ) THEN
+    SELECT user_id INTO _next
+    FROM public.chat_group_members
+    WHERE group_id = p_group_id
+      AND user_id <> _me
+    ORDER BY joined_at ASC, user_id ASC
+    LIMIT 1;
+    IF _next IS NOT NULL THEN
+      UPDATE public.chat_group_members
+      SET role = 'admin'
+      WHERE group_id = p_group_id
+        AND user_id = _next;
+    END IF;
+  END IF;
+
+  DELETE FROM public.chat_group_members
+  WHERE group_id = p_group_id
+    AND user_id = _me;
+
+  IF NOT EXISTS (
+    SELECT 1 FROM public.chat_group_members WHERE group_id = p_group_id
+  ) THEN
+    DELETE FROM public.chat_groups WHERE id = p_group_id;
+  END IF;
+END;
+$$;
+
+
+ALTER FUNCTION "public"."leave_chat_group"("p_group_id" "uuid") OWNER TO "postgres";
 
 
 CREATE OR REPLACE FUNCTION "public"."list_audit_log"("p_from" timestamp with time zone DEFAULT NULL::timestamp with time zone, "p_to" timestamp with time zone DEFAULT NULL::timestamp with time zone, "p_actor_id" "uuid" DEFAULT NULL::"uuid", "p_entity_type" "text" DEFAULT ''::"text", "p_action" "text" DEFAULT ''::"text", "p_search" "text" DEFAULT ''::"text", "p_limit" integer DEFAULT 50, "p_offset" integer DEFAULT 0) RETURNS TABLE("id" "uuid", "created_at" timestamp with time zone, "actor_id" "uuid", "actor_username" "text", "actor_full_name" "text", "action" "text", "entity_type" "text", "entity_id" "uuid", "parent_type" "text", "parent_id" "uuid", "summary" "text", "changes" "jsonb", "metadata" "jsonb", "form_label" "text", "subject_full_name" "text", "subject_username" "text", "on_behalf" boolean, "total_count" bigint)
@@ -7040,6 +7293,62 @@ $$;
 ALTER FUNCTION "public"."refresh_cost_invoice_monthly_rollups"() OWNER TO "postgres";
 
 
+CREATE OR REPLACE FUNCTION "public"."remove_chat_group_member"("p_group_id" "uuid", "p_user_id" "uuid") RETURNS "void"
+    LANGUAGE "plpgsql" SECURITY DEFINER
+    SET "search_path" TO 'public'
+    AS $$
+BEGIN
+  IF auth.uid() IS NULL OR NOT public.is_chat_group_admin(p_group_id) THEN
+    RAISE EXCEPTION 'Chat not found';
+  END IF;
+  IF p_user_id = auth.uid() THEN
+    RAISE EXCEPTION 'Leave the group instead';
+  END IF;
+  IF NOT EXISTS (
+    SELECT 1
+    FROM public.chat_group_members
+    WHERE group_id = p_group_id
+      AND user_id = p_user_id
+  ) THEN
+    RAISE EXCEPTION 'Person not found';
+  END IF;
+  DELETE FROM public.chat_group_members
+  WHERE group_id = p_group_id
+    AND user_id = p_user_id;
+END;
+$$;
+
+
+ALTER FUNCTION "public"."remove_chat_group_member"("p_group_id" "uuid", "p_user_id" "uuid") OWNER TO "postgres";
+
+
+CREATE OR REPLACE FUNCTION "public"."rename_chat_group"("p_group_id" "uuid", "p_name" "text") RETURNS "void"
+    LANGUAGE "plpgsql" SECURITY DEFINER
+    SET "search_path" TO 'public'
+    AS $$
+DECLARE
+  _name text;
+BEGIN
+  IF auth.uid() IS NULL OR NOT public.is_chat_group_admin(p_group_id) THEN
+    RAISE EXCEPTION 'Chat not found';
+  END IF;
+  _name := regexp_replace(btrim(coalesce(p_name, '')), '\s+', ' ', 'g');
+  IF _name = '' THEN
+    RAISE EXCEPTION 'Name the group';
+  END IF;
+  IF char_length(_name) > 80 THEN
+    RAISE EXCEPTION 'Group name is too long';
+  END IF;
+  UPDATE public.chat_groups
+  SET name = _name, updated_at = now()
+  WHERE id = p_group_id;
+END;
+$$;
+
+
+ALTER FUNCTION "public"."rename_chat_group"("p_group_id" "uuid", "p_name" "text") OWNER TO "postgres";
+
+
 CREATE OR REPLACE FUNCTION "public"."rename_cost_company_display"("p_from" "text", "p_to" "text") RETURNS "jsonb"
     LANGUAGE "plpgsql" SECURITY DEFINER
     SET "search_path" TO 'public'
@@ -8279,13 +8588,38 @@ CREATE TABLE IF NOT EXISTS "public"."audit_log" (
 ALTER TABLE "public"."audit_log" OWNER TO "postgres";
 
 
+CREATE TABLE IF NOT EXISTS "public"."chat_group_members" (
+    "group_id" "uuid" NOT NULL,
+    "user_id" "uuid" NOT NULL,
+    "role" "text" NOT NULL,
+    "joined_at" timestamp with time zone DEFAULT "now"() NOT NULL,
+    CONSTRAINT "chat_group_members_role_chk" CHECK (("role" = ANY (ARRAY['admin'::"text", 'member'::"text"])))
+);
+
+
+ALTER TABLE "public"."chat_group_members" OWNER TO "postgres";
+
+
+CREATE TABLE IF NOT EXISTS "public"."chat_groups" (
+    "id" "uuid" DEFAULT "gen_random_uuid"() NOT NULL,
+    "name" "text" NOT NULL,
+    "created_by" "uuid" NOT NULL,
+    "created_at" timestamp with time zone DEFAULT "now"() NOT NULL,
+    "updated_at" timestamp with time zone DEFAULT "now"() NOT NULL,
+    CONSTRAINT "chat_groups_name_chk" CHECK ((("char_length"("btrim"("name")) >= 1) AND ("char_length"("btrim"("name")) <= 80)))
+);
+
+
+ALTER TABLE "public"."chat_groups" OWNER TO "postgres";
+
+
 CREATE TABLE IF NOT EXISTS "public"."chat_message_reads" (
     "user_id" "uuid" NOT NULL,
     "thread_key" "text" NOT NULL,
     "message_id" "text" NOT NULL,
     "read_at" timestamp with time zone DEFAULT "now"() NOT NULL,
     CONSTRAINT "chat_message_reads_message_id_chk" CHECK (("message_id" ~* '^[0-9]{8}T[0-9]{9}-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'::"text")),
-    CONSTRAINT "chat_message_reads_thread_key_chk" CHECK (("thread_key" ~* '^(p:[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}|r:[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}:[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}|d:[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}:[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$'::"text"))
+    CONSTRAINT "chat_message_reads_thread_key_chk" CHECK (("thread_key" ~* '^(p:[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}|r:[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}:[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}|d:[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}:[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}|g:[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$'::"text"))
 );
 
 ALTER TABLE ONLY "public"."chat_message_reads" REPLICA IDENTITY FULL;
@@ -8299,7 +8633,7 @@ CREATE TABLE IF NOT EXISTS "public"."chat_read_cursors" (
     "thread_key" "text" NOT NULL,
     "last_read_message_id" "text" NOT NULL,
     "updated_at" timestamp with time zone DEFAULT "now"() NOT NULL,
-    CONSTRAINT "chat_read_cursors_thread_key_chk" CHECK (("thread_key" ~* '^(p:[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}|r:[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}:[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}|d:[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}:[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$'::"text"))
+    CONSTRAINT "chat_read_cursors_thread_key_chk" CHECK (("thread_key" ~* '^(p:[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}|r:[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}:[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}|d:[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}:[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}|g:[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$'::"text"))
 );
 
 
@@ -8311,7 +8645,7 @@ CREATE TABLE IF NOT EXISTS "public"."chat_thread_signals" (
     "message_id" "text" NOT NULL,
     "updated_at" timestamp with time zone DEFAULT "now"() NOT NULL,
     CONSTRAINT "chat_thread_signals_message_id_chk" CHECK (("message_id" ~* '^[0-9]{8}T[0-9]{9}-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'::"text")),
-    CONSTRAINT "chat_thread_signals_thread_key_chk" CHECK (("thread_key" ~* '^(p:[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}|r:[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}:[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}|d:[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}:[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$'::"text"))
+    CONSTRAINT "chat_thread_signals_thread_key_chk" CHECK (("thread_key" ~* '^(p:[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}|r:[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}:[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}|d:[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}:[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}|g:[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$'::"text"))
 );
 
 ALTER TABLE ONLY "public"."chat_thread_signals" REPLICA IDENTITY FULL;
@@ -9165,7 +9499,8 @@ CREATE TABLE IF NOT EXISTS "public"."project_assignments" (
     "project_id" "uuid" NOT NULL,
     "user_id" "uuid" NOT NULL,
     "assigned_by" "uuid",
-    "assigned_at" timestamp with time zone DEFAULT "now"() NOT NULL
+    "assigned_at" timestamp with time zone DEFAULT "now"() NOT NULL,
+    "skip_notification" boolean DEFAULT false NOT NULL
 );
 
 
@@ -9751,6 +10086,16 @@ ALTER TABLE ONLY "public"."audit_log"
 
 
 
+ALTER TABLE ONLY "public"."chat_group_members"
+    ADD CONSTRAINT "chat_group_members_pkey" PRIMARY KEY ("group_id", "user_id");
+
+
+
+ALTER TABLE ONLY "public"."chat_groups"
+    ADD CONSTRAINT "chat_groups_pkey" PRIMARY KEY ("id");
+
+
+
 ALTER TABLE ONLY "public"."chat_message_reads"
     ADD CONSTRAINT "chat_message_reads_pkey" PRIMARY KEY ("user_id", "thread_key", "message_id");
 
@@ -10289,6 +10634,10 @@ CREATE INDEX "audit_log_entity_idx" ON "public"."audit_log" USING "btree" ("enti
 
 
 CREATE INDEX "audit_log_parent_idx" ON "public"."audit_log" USING "btree" ("parent_type", "parent_id");
+
+
+
+CREATE INDEX "chat_group_members_user_idx" ON "public"."chat_group_members" USING "btree" ("user_id");
 
 
 
@@ -10928,6 +11277,10 @@ CREATE OR REPLACE TRIGGER "profiles_sync_todo_list_assignments" AFTER INSERT OR 
 
 
 
+CREATE OR REPLACE TRIGGER "projects_assign_privileged_members" AFTER INSERT ON "public"."projects" FOR EACH ROW EXECUTE FUNCTION "public"."assign_privileged_project_members"();
+
+
+
 CREATE OR REPLACE TRIGGER "projects_refresh_cost_search_text" AFTER UPDATE OF "code", "description" ON "public"."projects" FOR EACH ROW WHEN ((("new"."code" IS DISTINCT FROM "old"."code") OR ("new"."description" IS DISTINCT FROM "old"."description"))) EXECUTE FUNCTION "public"."projects_refresh_cost_search_text"();
 
 
@@ -11066,6 +11419,21 @@ CREATE OR REPLACE TRIGGER "update_cost_statement_dated_scans_updated_at" BEFORE 
 
 ALTER TABLE ONLY "public"."audit_log"
     ADD CONSTRAINT "audit_log_actor_id_fkey" FOREIGN KEY ("actor_id") REFERENCES "auth"."users"("id") ON DELETE SET NULL;
+
+
+
+ALTER TABLE ONLY "public"."chat_group_members"
+    ADD CONSTRAINT "chat_group_members_group_id_fkey" FOREIGN KEY ("group_id") REFERENCES "public"."chat_groups"("id") ON DELETE CASCADE;
+
+
+
+ALTER TABLE ONLY "public"."chat_group_members"
+    ADD CONSTRAINT "chat_group_members_user_id_fkey" FOREIGN KEY ("user_id") REFERENCES "auth"."users"("id") ON DELETE CASCADE;
+
+
+
+ALTER TABLE ONLY "public"."chat_groups"
+    ADD CONSTRAINT "chat_groups_created_by_fkey" FOREIGN KEY ("created_by") REFERENCES "auth"."users"("id") ON DELETE CASCADE;
 
 
 
@@ -11895,6 +12263,14 @@ CREATE POLICY "audit_log read with permission" ON "public"."audit_log" FOR SELEC
 
 
 
+CREATE POLICY "chat group members select" ON "public"."chat_group_members" FOR SELECT TO "authenticated" USING ("public"."is_chat_group_member"("group_id"));
+
+
+
+CREATE POLICY "chat groups select member" ON "public"."chat_groups" FOR SELECT TO "authenticated" USING ("public"."is_chat_group_member"("id"));
+
+
+
 CREATE POLICY "chat message reads insert own" ON "public"."chat_message_reads" FOR INSERT TO "authenticated" WITH CHECK ((("user_id" = "auth"."uid"()) AND "public"."chat_thread_visible"("thread_key")));
 
 
@@ -11925,6 +12301,12 @@ CREATE POLICY "chat thread signals select" ON "public"."chat_thread_signals" FOR
 
 CREATE POLICY "chat thread signals update" ON "public"."chat_thread_signals" FOR UPDATE TO "authenticated" USING ("public"."chat_thread_visible"("thread_key")) WITH CHECK ("public"."chat_thread_visible"("thread_key"));
 
+
+
+ALTER TABLE "public"."chat_group_members" ENABLE ROW LEVEL SECURITY;
+
+
+ALTER TABLE "public"."chat_groups" ENABLE ROW LEVEL SECURITY;
 
 
 ALTER TABLE "public"."chat_message_reads" ENABLE ROW LEVEL SECURITY;
@@ -13196,6 +13578,12 @@ GRANT USAGE ON SCHEMA "public" TO "service_role";
 
 
 
+REVOKE ALL ON FUNCTION "public"."add_chat_group_members"("p_group_id" "uuid", "p_member_ids" "uuid"[]) FROM PUBLIC;
+GRANT ALL ON FUNCTION "public"."add_chat_group_members"("p_group_id" "uuid", "p_member_ids" "uuid"[]) TO "authenticated";
+GRANT ALL ON FUNCTION "public"."add_chat_group_members"("p_group_id" "uuid", "p_member_ids" "uuid"[]) TO "service_role";
+
+
+
 REVOKE ALL ON FUNCTION "public"."admin_set_vault_secret"("p_name" "text", "p_value" "text") FROM PUBLIC;
 GRANT ALL ON FUNCTION "public"."admin_set_vault_secret"("p_name" "text", "p_value" "text") TO "service_role";
 
@@ -13251,6 +13639,11 @@ GRANT ALL ON FUNCTION "public"."assert_rpc_staff"() TO "service_role";
 
 REVOKE ALL ON FUNCTION "public"."assert_rpc_submissions_browser"("p_worker_id" "uuid", "p_allowed_worker_ids" "uuid"[]) FROM PUBLIC;
 GRANT ALL ON FUNCTION "public"."assert_rpc_submissions_browser"("p_worker_id" "uuid", "p_allowed_worker_ids" "uuid"[]) TO "service_role";
+
+
+
+REVOKE ALL ON FUNCTION "public"."assign_privileged_project_members"() FROM PUBLIC;
+GRANT ALL ON FUNCTION "public"."assign_privileged_project_members"() TO "service_role";
 
 
 
@@ -13717,6 +14110,12 @@ GRANT ALL ON FUNCTION "public"."create_app_role"("_slug" "text", "_label" "text"
 
 
 
+REVOKE ALL ON FUNCTION "public"."create_chat_group"("p_name" "text", "p_member_ids" "uuid"[]) FROM PUBLIC;
+GRANT ALL ON FUNCTION "public"."create_chat_group"("p_name" "text", "p_member_ids" "uuid"[]) TO "authenticated";
+GRANT ALL ON FUNCTION "public"."create_chat_group"("p_name" "text", "p_member_ids" "uuid"[]) TO "service_role";
+
+
+
 REVOKE ALL ON FUNCTION "public"."daily_briefing_autoapprove"() FROM PUBLIC;
 GRANT ALL ON FUNCTION "public"."daily_briefing_autoapprove"() TO "service_role";
 
@@ -13724,6 +14123,12 @@ GRANT ALL ON FUNCTION "public"."daily_briefing_autoapprove"() TO "service_role";
 
 REVOKE ALL ON FUNCTION "public"."delete_app_role"("_slug" "text") FROM PUBLIC;
 GRANT ALL ON FUNCTION "public"."delete_app_role"("_slug" "text") TO "service_role";
+
+
+
+REVOKE ALL ON FUNCTION "public"."delete_chat_group"("p_group_id" "uuid") FROM PUBLIC;
+GRANT ALL ON FUNCTION "public"."delete_chat_group"("p_group_id" "uuid") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."delete_chat_group"("p_group_id" "uuid") TO "service_role";
 
 
 
@@ -13877,6 +14282,18 @@ GRANT ALL ON FUNCTION "public"."is_assigned_to_todo_list"("_user_id" "uuid", "_l
 
 
 
+REVOKE ALL ON FUNCTION "public"."is_chat_group_admin"("p_group_id" "uuid") FROM PUBLIC;
+GRANT ALL ON FUNCTION "public"."is_chat_group_admin"("p_group_id" "uuid") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."is_chat_group_admin"("p_group_id" "uuid") TO "service_role";
+
+
+
+REVOKE ALL ON FUNCTION "public"."is_chat_group_member"("p_group_id" "uuid") FROM PUBLIC;
+GRANT ALL ON FUNCTION "public"."is_chat_group_member"("p_group_id" "uuid") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."is_chat_group_member"("p_group_id" "uuid") TO "service_role";
+
+
+
 GRANT ALL ON FUNCTION "public"."is_generic_email_domain"("p_domain" "text") TO "anon";
 GRANT ALL ON FUNCTION "public"."is_generic_email_domain"("p_domain" "text") TO "authenticated";
 GRANT ALL ON FUNCTION "public"."is_generic_email_domain"("p_domain" "text") TO "service_role";
@@ -13904,6 +14321,12 @@ GRANT ALL ON FUNCTION "public"."is_staff"("_user_id" "uuid") TO "service_role";
 REVOKE ALL ON FUNCTION "public"."is_staff_relay_domain"("p_domain" "text") FROM PUBLIC;
 GRANT ALL ON FUNCTION "public"."is_staff_relay_domain"("p_domain" "text") TO "authenticated";
 GRANT ALL ON FUNCTION "public"."is_staff_relay_domain"("p_domain" "text") TO "service_role";
+
+
+
+REVOKE ALL ON FUNCTION "public"."leave_chat_group"("p_group_id" "uuid") FROM PUBLIC;
+GRANT ALL ON FUNCTION "public"."leave_chat_group"("p_group_id" "uuid") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."leave_chat_group"("p_group_id" "uuid") TO "service_role";
 
 
 
@@ -14113,6 +14536,18 @@ REVOKE ALL ON FUNCTION "public"."refresh_cost_invoice_monthly_rollups"() FROM PU
 GRANT ALL ON FUNCTION "public"."refresh_cost_invoice_monthly_rollups"() TO "anon";
 GRANT ALL ON FUNCTION "public"."refresh_cost_invoice_monthly_rollups"() TO "authenticated";
 GRANT ALL ON FUNCTION "public"."refresh_cost_invoice_monthly_rollups"() TO "service_role";
+
+
+
+REVOKE ALL ON FUNCTION "public"."remove_chat_group_member"("p_group_id" "uuid", "p_user_id" "uuid") FROM PUBLIC;
+GRANT ALL ON FUNCTION "public"."remove_chat_group_member"("p_group_id" "uuid", "p_user_id" "uuid") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."remove_chat_group_member"("p_group_id" "uuid", "p_user_id" "uuid") TO "service_role";
+
+
+
+REVOKE ALL ON FUNCTION "public"."rename_chat_group"("p_group_id" "uuid", "p_name" "text") FROM PUBLIC;
+GRANT ALL ON FUNCTION "public"."rename_chat_group"("p_group_id" "uuid", "p_name" "text") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."rename_chat_group"("p_group_id" "uuid", "p_name" "text") TO "service_role";
 
 
 
@@ -14350,6 +14785,18 @@ GRANT ALL ON TABLE "public"."app_settings" TO "service_role";
 GRANT ALL ON TABLE "public"."audit_log" TO "anon";
 GRANT ALL ON TABLE "public"."audit_log" TO "authenticated";
 GRANT ALL ON TABLE "public"."audit_log" TO "service_role";
+
+
+
+GRANT ALL ON TABLE "public"."chat_group_members" TO "anon";
+GRANT ALL ON TABLE "public"."chat_group_members" TO "authenticated";
+GRANT ALL ON TABLE "public"."chat_group_members" TO "service_role";
+
+
+
+GRANT ALL ON TABLE "public"."chat_groups" TO "anon";
+GRANT ALL ON TABLE "public"."chat_groups" TO "authenticated";
+GRANT ALL ON TABLE "public"."chat_groups" TO "service_role";
 
 
 
