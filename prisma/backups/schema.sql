@@ -2472,20 +2472,52 @@ CREATE OR REPLACE FUNCTION "public"."chat_thread_visible"("p_thread_key" "text")
         WHERE p.id = substring(p_thread_key from 3 for 36)::uuid
       )
       AND (
-        public.is_assigned_to_project(auth.uid(), substring(p_thread_key from 3 for 36)::uuid)
-        OR public.has_role(auth.uid(), 'admin')
+        public.has_role(auth.uid(), 'admin')
+        OR public.is_project_chat_room_member(
+          substring(p_thread_key from 3 for 36)::uuid,
+          substring(p_thread_key from 40 for 36)::uuid,
+          auth.uid()
+        )
       )
     WHEN p_thread_key ~* '^d:[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}:[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$' THEN
       substring(p_thread_key from 3 for 36)::uuid = auth.uid()
       OR substring(p_thread_key from 40 for 36)::uuid = auth.uid()
     WHEN p_thread_key ~* '^g:[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$' THEN
-      public.is_chat_group_member(substring(p_thread_key from 3)::uuid)
+      EXISTS (
+        SELECT 1
+        FROM public.chat_groups g
+        WHERE g.id = substring(p_thread_key from 3)::uuid
+          AND g.archived_at IS NULL
+      )
+      AND public.is_chat_group_member(substring(p_thread_key from 3)::uuid)
     ELSE false
   END;
 $_$;
 
 
 ALTER FUNCTION "public"."chat_thread_visible"("p_thread_key" "text") OWNER TO "postgres";
+
+
+CREATE OR REPLACE FUNCTION "public"."clear_project_chat_room_members"("p_project_id" "uuid", "p_room_id" "uuid") RETURNS "void"
+    LANGUAGE "plpgsql" SECURITY DEFINER
+    SET "search_path" TO 'public'
+    AS $$
+BEGIN
+  IF auth.uid() IS NULL THEN
+    RAISE EXCEPTION 'Not signed in';
+  END IF;
+  IF NOT public.is_assigned_to_project(auth.uid(), p_project_id)
+    AND NOT public.has_role(auth.uid(), 'admin') THEN
+    RAISE EXCEPTION 'You are not assigned to this job';
+  END IF;
+  DELETE FROM public.project_chat_room_members
+  WHERE project_id = p_project_id
+    AND room_id = p_room_id;
+END;
+$$;
+
+
+ALTER FUNCTION "public"."clear_project_chat_room_members"("p_project_id" "uuid", "p_room_id" "uuid") OWNER TO "postgres";
 
 
 CREATE OR REPLACE FUNCTION "public"."company_match_key"("p_name" "text") RETURNS "text"
@@ -3747,7 +3779,11 @@ BEGIN
   IF NOT EXISTS (SELECT 1 FROM public.chat_groups WHERE id = p_group_id) THEN
     RAISE EXCEPTION 'Chat not found';
   END IF;
-  DELETE FROM public.chat_groups WHERE id = p_group_id;
+  UPDATE public.chat_groups
+  SET archived_at = now(),
+      archived_by = auth.uid(),
+      updated_at = now()
+  WHERE id = p_group_id;
 END;
 $$;
 
@@ -4597,6 +4633,28 @@ $$;
 
 
 ALTER FUNCTION "public"."is_legal_entity_name"("p_name" "text") OWNER TO "postgres";
+
+
+CREATE OR REPLACE FUNCTION "public"."is_project_chat_room_member"("p_project_id" "uuid", "p_room_id" "uuid", "p_user_id" "uuid") RETURNS boolean
+    LANGUAGE "sql" STABLE SECURITY DEFINER
+    SET "search_path" TO 'public'
+    AS $$
+  SELECT CASE
+    WHEN NOT public.project_chat_room_has_members(p_project_id, p_room_id) THEN
+      public.is_assigned_to_project(p_user_id, p_project_id)
+    ELSE
+      EXISTS (
+        SELECT 1
+        FROM public.project_chat_room_members
+        WHERE project_id = p_project_id
+          AND room_id = p_room_id
+          AND user_id = p_user_id
+      )
+  END;
+$$;
+
+
+ALTER FUNCTION "public"."is_project_chat_room_member"("p_project_id" "uuid", "p_room_id" "uuid", "p_user_id" "uuid") OWNER TO "postgres";
 
 
 CREATE OR REPLACE FUNCTION "public"."is_shared_invoice_portal_domain"("p_domain" "text") RETURNS boolean
@@ -6995,6 +7053,22 @@ $$;
 ALTER FUNCTION "public"."profiles_guard_sensitive_self_update"() OWNER TO "postgres";
 
 
+CREATE OR REPLACE FUNCTION "public"."project_chat_room_has_members"("p_project_id" "uuid", "p_room_id" "uuid") RETURNS boolean
+    LANGUAGE "sql" STABLE SECURITY DEFINER
+    SET "search_path" TO 'public'
+    AS $$
+  SELECT EXISTS (
+    SELECT 1
+    FROM public.project_chat_room_members
+    WHERE project_id = p_project_id
+      AND room_id = p_room_id
+  );
+$$;
+
+
+ALTER FUNCTION "public"."project_chat_room_has_members"("p_project_id" "uuid", "p_room_id" "uuid") OWNER TO "postgres";
+
+
 CREATE OR REPLACE FUNCTION "public"."projects_refresh_cost_search_text"() RETURNS "trigger"
     LANGUAGE "plpgsql" SECURITY DEFINER
     SET "search_path" TO 'public'
@@ -7927,6 +8001,66 @@ $$;
 ALTER FUNCTION "public"."set_integration_secret"("p_name" "text", "p_value" "text") OWNER TO "postgres";
 
 
+CREATE OR REPLACE FUNCTION "public"."set_project_chat_room_members"("p_project_id" "uuid", "p_room_id" "uuid", "p_member_ids" "uuid"[]) RETURNS "void"
+    LANGUAGE "plpgsql" SECURITY DEFINER
+    SET "search_path" TO 'public'
+    AS $$
+DECLARE
+  _me uuid := auth.uid();
+  _picked uuid;
+BEGIN
+  IF _me IS NULL THEN
+    RAISE EXCEPTION 'Not signed in';
+  END IF;
+  IF NOT public.is_assigned_to_project(_me, p_project_id) AND NOT public.has_role(_me, 'admin') THEN
+    RAISE EXCEPTION 'You are not assigned to this job';
+  END IF;
+  DELETE FROM public.project_chat_room_members
+  WHERE project_id = p_project_id
+    AND room_id = p_room_id;
+
+  IF p_member_ids IS NULL OR cardinality(p_member_ids) = 0 THEN
+    RETURN;
+  END IF;
+
+  IF (
+    SELECT count(DISTINCT picked.user_id)
+    FROM unnest(p_member_ids) AS picked(user_id)
+    WHERE picked.user_id IS NOT NULL
+  ) > 100 THEN
+    RAISE EXCEPTION 'Choose up to 100 people';
+  END IF;
+
+  FOR _picked IN
+    SELECT DISTINCT picked.user_id
+    FROM unnest(p_member_ids) AS picked(user_id)
+    WHERE picked.user_id IS NOT NULL
+  LOOP
+    IF NOT EXISTS (
+      SELECT 1
+      FROM public.profiles p
+      WHERE p.id = _picked
+        AND p.active
+        AND p.archived_at IS NULL
+    ) THEN
+      RAISE EXCEPTION 'Choose people who can sign in';
+    END IF;
+
+    INSERT INTO public.project_assignments (project_id, user_id, assigned_by)
+    VALUES (p_project_id, _picked, _me)
+    ON CONFLICT (project_id, user_id) DO NOTHING;
+
+    INSERT INTO public.project_chat_room_members (project_id, room_id, user_id, assigned_by)
+    VALUES (p_project_id, p_room_id, _picked, _me)
+    ON CONFLICT (project_id, room_id, user_id) DO NOTHING;
+  END LOOP;
+END;
+$$;
+
+
+ALTER FUNCTION "public"."set_project_chat_room_members"("p_project_id" "uuid", "p_room_id" "uuid", "p_member_ids" "uuid"[]) OWNER TO "postgres";
+
+
 CREATE OR REPLACE FUNCTION "public"."set_rams_documents_updated_at"() RETURNS "trigger"
     LANGUAGE "plpgsql"
     AS $$
@@ -8606,6 +8740,8 @@ CREATE TABLE IF NOT EXISTS "public"."chat_groups" (
     "created_by" "uuid" NOT NULL,
     "created_at" timestamp with time zone DEFAULT "now"() NOT NULL,
     "updated_at" timestamp with time zone DEFAULT "now"() NOT NULL,
+    "archived_at" timestamp with time zone,
+    "archived_by" "uuid",
     CONSTRAINT "chat_groups_name_chk" CHECK ((("char_length"("btrim"("name")) >= 1) AND ("char_length"("btrim"("name")) <= 80)))
 );
 
@@ -9369,7 +9505,9 @@ CREATE TABLE IF NOT EXISTS "public"."notification_preferences" (
     "user_management" boolean DEFAULT true NOT NULL,
     "team_member_changes" boolean DEFAULT true NOT NULL,
     "cost_payment_made" boolean DEFAULT true NOT NULL,
-    "project_chat" boolean DEFAULT true NOT NULL
+    "project_chat" boolean DEFAULT true NOT NULL,
+    "direct_chat" boolean DEFAULT true NOT NULL,
+    "group_chat" boolean DEFAULT true NOT NULL
 );
 
 
@@ -9516,6 +9654,18 @@ CREATE TABLE IF NOT EXISTS "public"."project_chat_cursors" (
 
 
 ALTER TABLE "public"."project_chat_cursors" OWNER TO "postgres";
+
+
+CREATE TABLE IF NOT EXISTS "public"."project_chat_room_members" (
+    "project_id" "uuid" NOT NULL,
+    "room_id" "uuid" NOT NULL,
+    "user_id" "uuid" NOT NULL,
+    "assigned_by" "uuid",
+    "assigned_at" timestamp with time zone DEFAULT "now"() NOT NULL
+);
+
+
+ALTER TABLE "public"."project_chat_room_members" OWNER TO "postgres";
 
 
 CREATE TABLE IF NOT EXISTS "public"."projects" (
@@ -10411,6 +10561,11 @@ ALTER TABLE ONLY "public"."project_chat_cursors"
 
 
 
+ALTER TABLE ONLY "public"."project_chat_room_members"
+    ADD CONSTRAINT "project_chat_room_members_pkey" PRIMARY KEY ("project_id", "room_id", "user_id");
+
+
+
 ALTER TABLE ONLY "public"."projects"
     ADD CONSTRAINT "projects_client_id_code_key" UNIQUE ("client_id", "code");
 
@@ -10945,6 +11100,10 @@ CREATE INDEX "project_assignments_user_idx" ON "public"."project_assignments" US
 
 
 
+CREATE INDEX "project_chat_room_members_user_idx" ON "public"."project_chat_room_members" USING "btree" ("user_id");
+
+
+
 CREATE INDEX "rams_briefings_briefer_id_briefing_date_idx" ON "public"."rams_briefings" USING "btree" ("briefer_id", "briefing_date" DESC);
 
 
@@ -11433,6 +11592,11 @@ ALTER TABLE ONLY "public"."chat_group_members"
 
 
 ALTER TABLE ONLY "public"."chat_groups"
+    ADD CONSTRAINT "chat_groups_archived_by_fkey" FOREIGN KEY ("archived_by") REFERENCES "auth"."users"("id") ON DELETE SET NULL;
+
+
+
+ALTER TABLE ONLY "public"."chat_groups"
     ADD CONSTRAINT "chat_groups_created_by_fkey" FOREIGN KEY ("created_by") REFERENCES "auth"."users"("id") ON DELETE CASCADE;
 
 
@@ -11734,6 +11898,21 @@ ALTER TABLE ONLY "public"."project_chat_cursors"
 
 ALTER TABLE ONLY "public"."project_chat_cursors"
     ADD CONSTRAINT "project_chat_cursors_user_id_fkey" FOREIGN KEY ("user_id") REFERENCES "auth"."users"("id") ON DELETE CASCADE;
+
+
+
+ALTER TABLE ONLY "public"."project_chat_room_members"
+    ADD CONSTRAINT "project_chat_room_members_assigned_by_fkey" FOREIGN KEY ("assigned_by") REFERENCES "auth"."users"("id") ON DELETE SET NULL;
+
+
+
+ALTER TABLE ONLY "public"."project_chat_room_members"
+    ADD CONSTRAINT "project_chat_room_members_project_id_fkey" FOREIGN KEY ("project_id") REFERENCES "public"."projects"("id") ON DELETE CASCADE;
+
+
+
+ALTER TABLE ONLY "public"."project_chat_room_members"
+    ADD CONSTRAINT "project_chat_room_members_user_id_fkey" FOREIGN KEY ("user_id") REFERENCES "auth"."users"("id") ON DELETE CASCADE;
 
 
 
@@ -12719,10 +12898,17 @@ CREATE POLICY "project chat cursors update own" ON "public"."project_chat_cursor
 
 
 
+CREATE POLICY "project chat room members select assigned job" ON "public"."project_chat_room_members" FOR SELECT TO "authenticated" USING (("public"."is_assigned_to_project"("auth"."uid"(), "project_id") OR "public"."has_role"("auth"."uid"(), 'admin'::"text")));
+
+
+
 ALTER TABLE "public"."project_assignments" ENABLE ROW LEVEL SECURITY;
 
 
 ALTER TABLE "public"."project_chat_cursors" ENABLE ROW LEVEL SECURITY;
+
+
+ALTER TABLE "public"."project_chat_room_members" ENABLE ROW LEVEL SECURITY;
 
 
 ALTER TABLE "public"."projects" ENABLE ROW LEVEL SECURITY;
@@ -13929,6 +14115,12 @@ GRANT ALL ON FUNCTION "public"."chat_thread_visible"("p_thread_key" "text") TO "
 
 
 
+REVOKE ALL ON FUNCTION "public"."clear_project_chat_room_members"("p_project_id" "uuid", "p_room_id" "uuid") FROM PUBLIC;
+GRANT ALL ON FUNCTION "public"."clear_project_chat_room_members"("p_project_id" "uuid", "p_room_id" "uuid") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."clear_project_chat_room_members"("p_project_id" "uuid", "p_room_id" "uuid") TO "service_role";
+
+
+
 GRANT ALL ON FUNCTION "public"."company_match_key"("p_name" "text") TO "anon";
 GRANT ALL ON FUNCTION "public"."company_match_key"("p_name" "text") TO "authenticated";
 GRANT ALL ON FUNCTION "public"."company_match_key"("p_name" "text") TO "service_role";
@@ -14306,6 +14498,12 @@ GRANT ALL ON FUNCTION "public"."is_legal_entity_name"("p_name" "text") TO "servi
 
 
 
+REVOKE ALL ON FUNCTION "public"."is_project_chat_room_member"("p_project_id" "uuid", "p_room_id" "uuid", "p_user_id" "uuid") FROM PUBLIC;
+GRANT ALL ON FUNCTION "public"."is_project_chat_room_member"("p_project_id" "uuid", "p_room_id" "uuid", "p_user_id" "uuid") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."is_project_chat_room_member"("p_project_id" "uuid", "p_room_id" "uuid", "p_user_id" "uuid") TO "service_role";
+
+
+
 GRANT ALL ON FUNCTION "public"."is_shared_invoice_portal_domain"("p_domain" "text") TO "anon";
 GRANT ALL ON FUNCTION "public"."is_shared_invoice_portal_domain"("p_domain" "text") TO "authenticated";
 GRANT ALL ON FUNCTION "public"."is_shared_invoice_portal_domain"("p_domain" "text") TO "service_role";
@@ -14506,6 +14704,12 @@ GRANT ALL ON FUNCTION "public"."profiles_guard_sensitive_self_update"() TO "serv
 
 
 
+REVOKE ALL ON FUNCTION "public"."project_chat_room_has_members"("p_project_id" "uuid", "p_room_id" "uuid") FROM PUBLIC;
+GRANT ALL ON FUNCTION "public"."project_chat_room_has_members"("p_project_id" "uuid", "p_room_id" "uuid") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."project_chat_room_has_members"("p_project_id" "uuid", "p_room_id" "uuid") TO "service_role";
+
+
+
 GRANT ALL ON FUNCTION "public"."projects_refresh_cost_search_text"() TO "anon";
 GRANT ALL ON FUNCTION "public"."projects_refresh_cost_search_text"() TO "authenticated";
 GRANT ALL ON FUNCTION "public"."projects_refresh_cost_search_text"() TO "service_role";
@@ -14612,6 +14816,12 @@ GRANT ALL ON FUNCTION "public"."set_cost_invoice_company_override"("p_id" "uuid"
 REVOKE ALL ON FUNCTION "public"."set_integration_secret"("p_name" "text", "p_value" "text") FROM PUBLIC;
 GRANT ALL ON FUNCTION "public"."set_integration_secret"("p_name" "text", "p_value" "text") TO "authenticated";
 GRANT ALL ON FUNCTION "public"."set_integration_secret"("p_name" "text", "p_value" "text") TO "service_role";
+
+
+
+REVOKE ALL ON FUNCTION "public"."set_project_chat_room_members"("p_project_id" "uuid", "p_room_id" "uuid", "p_member_ids" "uuid"[]) FROM PUBLIC;
+GRANT ALL ON FUNCTION "public"."set_project_chat_room_members"("p_project_id" "uuid", "p_room_id" "uuid", "p_member_ids" "uuid"[]) TO "authenticated";
+GRANT ALL ON FUNCTION "public"."set_project_chat_room_members"("p_project_id" "uuid", "p_room_id" "uuid", "p_member_ids" "uuid"[]) TO "service_role";
 
 
 
@@ -15150,6 +15360,12 @@ GRANT ALL ON TABLE "public"."project_assignments" TO "service_role";
 GRANT ALL ON TABLE "public"."project_chat_cursors" TO "anon";
 GRANT ALL ON TABLE "public"."project_chat_cursors" TO "authenticated";
 GRANT ALL ON TABLE "public"."project_chat_cursors" TO "service_role";
+
+
+
+GRANT ALL ON TABLE "public"."project_chat_room_members" TO "anon";
+GRANT ALL ON TABLE "public"."project_chat_room_members" TO "authenticated";
+GRANT ALL ON TABLE "public"."project_chat_room_members" TO "service_role";
 
 
 
