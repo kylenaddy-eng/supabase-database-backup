@@ -4624,6 +4624,19 @@ $$;
 ALTER FUNCTION "public"."is_generic_email_domain"("p_domain" "text") OWNER TO "postgres";
 
 
+CREATE OR REPLACE FUNCTION "public"."is_job_chat_privileged"("_user_id" "uuid") RETURNS boolean
+    LANGUAGE "sql" STABLE SECURITY DEFINER
+    SET "search_path" TO 'public'
+    AS $$
+  SELECT public.has_role(_user_id, 'admin')
+    OR public.has_role(_user_id, 'super_admin')
+    OR public.has_role(_user_id, 'cost_admin');
+$$;
+
+
+ALTER FUNCTION "public"."is_job_chat_privileged"("_user_id" "uuid") OWNER TO "postgres";
+
+
 CREATE OR REPLACE FUNCTION "public"."is_legal_entity_name"("p_name" "text") RETURNS boolean
     LANGUAGE "sql" IMMUTABLE
     SET "search_path" TO 'public'
@@ -4640,6 +4653,7 @@ CREATE OR REPLACE FUNCTION "public"."is_project_chat_room_member"("p_project_id"
     SET "search_path" TO 'public'
     AS $$
   SELECT CASE
+    WHEN public.is_job_chat_privileged(p_user_id) THEN true
     WHEN NOT public.project_chat_room_has_members(p_project_id, p_room_id) THEN
       public.is_assigned_to_project(p_user_id, p_project_id)
     ELSE
@@ -8309,6 +8323,34 @@ $$;
 ALTER FUNCTION "public"."timesheet_days_touch_parent"() OWNER TO "postgres";
 
 
+CREATE OR REPLACE FUNCTION "public"."timesheets_set_revision"() RETURNS "trigger"
+    LANGUAGE "plpgsql" SECURITY DEFINER
+    SET "search_path" TO 'public'
+    AS $$
+BEGIN
+  IF pg_trigger_depth() > 1 THEN
+    RETURN NEW;
+  END IF;
+
+  IF TG_OP = 'INSERT' THEN
+    NEW.revision := 1;
+    RETURN NEW;
+  END IF;
+
+  IF NEW.status = 'approved'::public.submission_status THEN
+    NEW.revision := 2;
+  ELSE
+    NEW.revision := 1;
+  END IF;
+
+  RETURN NEW;
+END;
+$$;
+
+
+ALTER FUNCTION "public"."timesheets_set_revision"() OWNER TO "postgres";
+
+
 CREATE OR REPLACE FUNCTION "public"."timesheets_snapshot_and_autoapprove"() RETURNS "trigger"
     LANGUAGE "plpgsql" SECURITY DEFINER
     SET "search_path" TO 'public'
@@ -9470,6 +9512,7 @@ CREATE TABLE IF NOT EXISTS "public"."nas_sync_queue" (
     "last_attempt_at" timestamp with time zone,
     "created_at" timestamp with time zone DEFAULT "now"() NOT NULL,
     "updated_at" timestamp with time zone DEFAULT "now"() NOT NULL,
+    "pdf_target" "text" DEFAULT ''::"text" NOT NULL,
     CONSTRAINT "nas_sync_queue_status_check" CHECK (("status" = ANY (ARRAY['pending'::"text", 'synced'::"text", 'failed'::"text"])))
 );
 
@@ -9507,7 +9550,9 @@ CREATE TABLE IF NOT EXISTS "public"."notification_preferences" (
     "cost_payment_made" boolean DEFAULT true NOT NULL,
     "project_chat" boolean DEFAULT true NOT NULL,
     "direct_chat" boolean DEFAULT true NOT NULL,
-    "group_chat" boolean DEFAULT true NOT NULL
+    "group_chat" boolean DEFAULT true NOT NULL,
+    "material_order_status" boolean DEFAULT true NOT NULL,
+    "material_quote_response" boolean DEFAULT true NOT NULL
 );
 
 
@@ -10492,11 +10537,6 @@ ALTER TABLE ONLY "public"."invoices"
 
 
 ALTER TABLE ONLY "public"."nas_sync_queue"
-    ADD CONSTRAINT "nas_sync_queue_kind_submission_unique" UNIQUE ("kind", "submission_id");
-
-
-
-ALTER TABLE ONLY "public"."nas_sync_queue"
     ADD CONSTRAINT "nas_sync_queue_pkey" PRIMARY KEY ("id");
 
 
@@ -11064,6 +11104,10 @@ CREATE INDEX "invoices_search_document_idx" ON "public"."invoices" USING "gin" (
 
 
 
+CREATE UNIQUE INDEX "nas_sync_queue_kind_submission_target_uidx" ON "public"."nas_sync_queue" USING "btree" ("kind", "submission_id", "pdf_target");
+
+
+
 CREATE INDEX "nas_sync_queue_status_idx" ON "public"."nas_sync_queue" USING "btree" ("status", "created_at");
 
 
@@ -11332,10 +11376,6 @@ CREATE OR REPLACE TRIGGER "bump_revision_trg" BEFORE UPDATE ON "public"."rams_br
 
 
 
-CREATE OR REPLACE TRIGGER "bump_revision_trg" BEFORE UPDATE ON "public"."timesheets" FOR EACH ROW EXECUTE FUNCTION "public"."bump_revision"();
-
-
-
 CREATE OR REPLACE TRIGGER "bump_revision_trg" BEFORE UPDATE ON "public"."toolbox_talks" FOR EACH ROW EXECUTE FUNCTION "public"."bump_revision"();
 
 
@@ -11469,6 +11509,10 @@ CREATE OR REPLACE TRIGGER "set_invoice_lines_updated_at" BEFORE UPDATE ON "publi
 
 
 CREATE OR REPLACE TRIGGER "set_nas_sync_queue_updated_at" BEFORE UPDATE ON "public"."nas_sync_queue" FOR EACH ROW EXECUTE FUNCTION "public"."set_updated_at"();
+
+
+
+CREATE OR REPLACE TRIGGER "timesheets_revision_trg" BEFORE INSERT OR UPDATE ON "public"."timesheets" FOR EACH ROW EXECUTE FUNCTION "public"."timesheets_set_revision"();
 
 
 
@@ -12419,11 +12463,19 @@ CREATE POLICY "Staff can view NAS sync queue" ON "public"."nas_sync_queue" FOR S
 ALTER TABLE "public"."app_settings" ENABLE ROW LEVEL SECURITY;
 
 
-CREATE POLICY "assignments admin write" ON "public"."project_assignments" TO "authenticated" USING ("public"."has_role_app_role_deprecated"("auth"."uid"(), 'admin'::"public"."app_role")) WITH CHECK ("public"."has_role_app_role_deprecated"("auth"."uid"(), 'admin'::"public"."app_role"));
+CREATE POLICY "assignments admin delete" ON "public"."project_assignments" FOR DELETE TO "authenticated" USING (("public"."has_role"("auth"."uid"(), 'admin'::"text") AND (NOT "public"."is_job_chat_privileged"("user_id"))));
 
 
 
-CREATE POLICY "assignments manager delete" ON "public"."project_assignments" FOR DELETE TO "authenticated" USING (("public"."has_role_app_role_deprecated"("auth"."uid"(), 'manager'::"public"."app_role") AND "public"."is_assigned_to_project"("auth"."uid"(), "project_id") AND ("public"."user_subcontractor"("auth"."uid"()) IS NOT NULL) AND ("public"."user_subcontractor"("auth"."uid"()) = "public"."user_subcontractor"("user_id"))));
+CREATE POLICY "assignments admin insert" ON "public"."project_assignments" FOR INSERT TO "authenticated" WITH CHECK ("public"."has_role"("auth"."uid"(), 'admin'::"text"));
+
+
+
+CREATE POLICY "assignments admin update" ON "public"."project_assignments" FOR UPDATE TO "authenticated" USING ("public"."has_role"("auth"."uid"(), 'admin'::"text")) WITH CHECK ("public"."has_role"("auth"."uid"(), 'admin'::"text"));
+
+
+
+CREATE POLICY "assignments manager delete" ON "public"."project_assignments" FOR DELETE TO "authenticated" USING (("public"."has_role"("auth"."uid"(), 'manager'::"text") AND "public"."is_assigned_to_project"("auth"."uid"(), "project_id") AND ("public"."user_subcontractor"("auth"."uid"()) IS NOT NULL) AND ("public"."user_subcontractor"("auth"."uid"()) = "public"."user_subcontractor"("user_id")) AND (NOT "public"."is_job_chat_privileged"("user_id"))));
 
 
 
@@ -14492,6 +14544,12 @@ GRANT ALL ON FUNCTION "public"."is_generic_email_domain"("p_domain" "text") TO "
 
 
 
+REVOKE ALL ON FUNCTION "public"."is_job_chat_privileged"("_user_id" "uuid") FROM PUBLIC;
+GRANT ALL ON FUNCTION "public"."is_job_chat_privileged"("_user_id" "uuid") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."is_job_chat_privileged"("_user_id" "uuid") TO "service_role";
+
+
+
 GRANT ALL ON FUNCTION "public"."is_legal_entity_name"("p_name" "text") TO "anon";
 GRANT ALL ON FUNCTION "public"."is_legal_entity_name"("p_name" "text") TO "authenticated";
 GRANT ALL ON FUNCTION "public"."is_legal_entity_name"("p_name" "text") TO "service_role";
@@ -14896,6 +14954,11 @@ GRANT ALL ON FUNCTION "public"."sync_todo_list_assignments_for_profile"() TO "se
 
 REVOKE ALL ON FUNCTION "public"."timesheet_days_touch_parent"() FROM PUBLIC;
 GRANT ALL ON FUNCTION "public"."timesheet_days_touch_parent"() TO "service_role";
+
+
+
+REVOKE ALL ON FUNCTION "public"."timesheets_set_revision"() FROM PUBLIC;
+GRANT ALL ON FUNCTION "public"."timesheets_set_revision"() TO "service_role";
 
 
 
