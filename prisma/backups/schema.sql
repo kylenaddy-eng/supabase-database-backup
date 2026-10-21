@@ -3017,6 +3017,17 @@ CREATE OR REPLACE FUNCTION "public"."cost_invoice_matches_project"("p_invoice" "
     WHEN p_f_project = '__overhead' THEN
       coalesce(p_invoice.is_overhead, false)
       OR coalesce(p_split_is_overhead, false)
+    WHEN p_f_project = '__no_project' THEN
+      (
+        NOT coalesce(p_invoice.is_overhead, false)
+        AND p_invoice.project_id IS NULL
+        AND coalesce(btrim(p_invoice.project_other), '') = ''
+      )
+      OR (
+        p_split_project_id IS NULL
+        AND NOT coalesce(p_split_is_overhead, false)
+        AND coalesce(btrim(p_split_project_other), '') = ''
+      )
     WHEN left(p_f_project, 6) = 'other:' THEN
       (
         p_invoice.project_id IS NULL
@@ -4992,12 +5003,31 @@ CREATE OR REPLACE FUNCTION "public"."list_cost_invoice_filter_options"() RETURNS
     SELECT
       EXISTS (SELECT 1 FROM invoice_assignments WHERE is_overhead)
       OR EXISTS (SELECT 1 FROM split_assignments WHERE is_overhead) AS has_overhead
+  ),
+  no_project_flag AS (
+    SELECT
+      EXISTS (
+        SELECT 1
+        FROM public.cost_invoices ci, auth_guard
+        WHERE public.cost_invoice_visible_to_caller(ci)
+          AND NOT coalesce(ci.is_overhead, false)
+          AND ci.project_id IS NULL
+          AND coalesce(btrim(ci.project_other), '') = ''
+      )
+      OR EXISTS (
+        SELECT 1
+        FROM split_assignments s
+        WHERE NOT s.is_overhead
+          AND s.project_id IS NULL
+          AND coalesce(btrim(s.project_other), '') = ''
+      ) AS has_no_project
   )
   SELECT jsonb_build_object(
     'projectIds', coalesce((SELECT jsonb_agg(project_id ORDER BY project_id) FROM project_ids), '[]'::jsonb),
     'otherProjects', coalesce((SELECT jsonb_agg(project_other ORDER BY project_other) FROM other_projects), '[]'::jsonb),
     'descriptions', coalesce((SELECT jsonb_agg(description ORDER BY description) FROM descriptions), '[]'::jsonb),
-    'hasOverhead', (SELECT has_overhead FROM overhead_flag)
+    'hasOverhead', (SELECT has_overhead FROM overhead_flag),
+    'hasNoProject', (SELECT has_no_project FROM no_project_flag)
   );
 $$;
 
