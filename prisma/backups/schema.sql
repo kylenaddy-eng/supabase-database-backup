@@ -2665,6 +2665,29 @@ $$;
 ALTER FUNCTION "public"."continue_statement_scan"("p_url" "text", "p_apikey" "text") OWNER TO "postgres";
 
 
+CREATE OR REPLACE FUNCTION "public"."cost_invoice_assignment_matches_project"("p_project_id" "uuid", "p_project_other" "text", "p_is_overhead" boolean, "p_f_project" "text") RETURNS boolean
+    LANGUAGE "sql" IMMUTABLE
+    SET "search_path" TO 'public'
+    AS $$
+  SELECT CASE
+    WHEN coalesce(nullif(trim(p_f_project), ''), NULL) IS NULL THEN true
+    WHEN p_f_project = '__overhead' THEN coalesce(p_is_overhead, false)
+    WHEN p_f_project = '__no_project' THEN
+      NOT coalesce(p_is_overhead, false)
+      AND p_project_id IS NULL
+      AND coalesce(btrim(p_project_other), '') = ''
+    WHEN left(p_f_project, 6) = 'other:' THEN
+      p_project_id IS NULL
+      AND NOT coalesce(p_is_overhead, false)
+      AND coalesce(p_project_other, '') = substring(p_f_project FROM 7)
+    ELSE p_project_id::text = p_f_project
+  END;
+$$;
+
+
+ALTER FUNCTION "public"."cost_invoice_assignment_matches_project"("p_project_id" "uuid", "p_project_other" "text", "p_is_overhead" boolean, "p_f_project" "text") OWNER TO "postgres";
+
+
 CREATE OR REPLACE FUNCTION "public"."cost_invoice_business_dedupe_key"("p_company_invoice_key" "text", "p_invoice_date" "date", "p_total_amount" numeric, "p_po_reference" "text") RETURNS "text"
     LANGUAGE "sql" IMMUTABLE
     SET "search_path" TO 'public'
@@ -3053,17 +3076,25 @@ CREATE OR REPLACE FUNCTION "public"."cost_invoice_matches_relation_filters"("p_c
     LANGUAGE "sql" STABLE
     SET "search_path" TO 'public'
     AS $$
-  -- p_f_text is unused here. Character search is the caller's search_text predicate.
   SELECT
     (
       coalesce(nullif(btrim(p_f_project), ''), NULL) IS NULL
-      OR public.cost_invoice_matches_project(p_ci, NULL, NULL, false, p_f_project)
+      OR (
+        NOT EXISTS (
+          SELECT 1
+          FROM public.cost_invoice_splits s
+          WHERE s.cost_invoice_id = p_ci.id
+        )
+        AND public.cost_invoice_assignment_matches_project(
+          p_ci.project_id, p_ci.project_other, p_ci.is_overhead, p_f_project
+        )
+      )
       OR EXISTS (
         SELECT 1
         FROM public.cost_invoice_splits s
         WHERE s.cost_invoice_id = p_ci.id
-          AND public.cost_invoice_matches_project(
-            p_ci, s.project_id, s.project_other, s.is_overhead, p_f_project
+          AND public.cost_invoice_assignment_matches_project(
+            s.project_id, s.project_other, s.is_overhead, p_f_project
           )
       )
     )
@@ -5013,6 +5044,11 @@ CREATE OR REPLACE FUNCTION "public"."list_cost_invoice_filter_options"() RETURNS
           AND NOT coalesce(ci.is_overhead, false)
           AND ci.project_id IS NULL
           AND coalesce(btrim(ci.project_other), '') = ''
+          AND NOT EXISTS (
+            SELECT 1
+            FROM public.cost_invoice_splits s
+            WHERE s.cost_invoice_id = ci.id
+          )
       )
       OR EXISTS (
         SELECT 1
@@ -14222,6 +14258,13 @@ GRANT ALL ON FUNCTION "public"."continue_cost_scan"("p_url" "text", "p_apikey" "
 
 REVOKE ALL ON FUNCTION "public"."continue_statement_scan"("p_url" "text", "p_apikey" "text") FROM PUBLIC;
 GRANT ALL ON FUNCTION "public"."continue_statement_scan"("p_url" "text", "p_apikey" "text") TO "service_role";
+
+
+
+REVOKE ALL ON FUNCTION "public"."cost_invoice_assignment_matches_project"("p_project_id" "uuid", "p_project_other" "text", "p_is_overhead" boolean, "p_f_project" "text") FROM PUBLIC;
+GRANT ALL ON FUNCTION "public"."cost_invoice_assignment_matches_project"("p_project_id" "uuid", "p_project_other" "text", "p_is_overhead" boolean, "p_f_project" "text") TO "anon";
+GRANT ALL ON FUNCTION "public"."cost_invoice_assignment_matches_project"("p_project_id" "uuid", "p_project_other" "text", "p_is_overhead" boolean, "p_f_project" "text") TO "authenticated";
+GRANT ALL ON FUNCTION "public"."cost_invoice_assignment_matches_project"("p_project_id" "uuid", "p_project_other" "text", "p_is_overhead" boolean, "p_f_project" "text") TO "service_role";
 
 
 
