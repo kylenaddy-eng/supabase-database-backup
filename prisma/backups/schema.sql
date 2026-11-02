@@ -7180,6 +7180,36 @@ $$;
 ALTER FUNCTION "public"."projects_refresh_cost_search_text"() OWNER TO "postgres";
 
 
+CREATE OR REPLACE FUNCTION "public"."quotations_before_insert"() RETURNS "trigger"
+    LANGUAGE "plpgsql" SECURITY DEFINER
+    SET "search_path" TO 'public'
+    AS $$
+DECLARE
+  v_name text;
+  v_addr text;
+BEGIN
+  IF NEW.client_id IS NOT NULL
+     AND (NEW.client_name_snapshot IS NULL OR NEW.client_name_snapshot = ''
+       OR NEW.client_address_snapshot IS NULL OR NEW.client_address_snapshot = '') THEN
+    SELECT name, address INTO v_name, v_addr FROM public.invoice_clients WHERE id = NEW.client_id;
+    IF NEW.client_name_snapshot IS NULL OR NEW.client_name_snapshot = '' THEN
+      NEW.client_name_snapshot := COALESCE(v_name, '');
+    END IF;
+    IF NEW.client_address_snapshot IS NULL OR NEW.client_address_snapshot = '' THEN
+      NEW.client_address_snapshot := COALESCE(v_addr, '');
+    END IF;
+  END IF;
+  IF NEW.created_by IS NULL THEN
+    NEW.created_by := auth.uid();
+  END IF;
+  RETURN NEW;
+END;
+$$;
+
+
+ALTER FUNCTION "public"."quotations_before_insert"() OWNER TO "postgres";
+
+
 CREATE OR REPLACE FUNCTION "public"."record_audit_event"("p_actor_id" "uuid", "p_action" "text", "p_entity_type" "text", "p_summary" "text", "p_entity_id" "uuid" DEFAULT NULL::"uuid", "p_parent_type" "text" DEFAULT NULL::"text", "p_parent_id" "uuid" DEFAULT NULL::"uuid", "p_changes" "jsonb" DEFAULT NULL::"jsonb", "p_metadata" "jsonb" DEFAULT NULL::"jsonb") RETURNS "uuid"
     LANGUAGE "plpgsql" SECURITY DEFINER
     SET "search_path" TO 'public'
@@ -9812,6 +9842,59 @@ CREATE TABLE IF NOT EXISTS "public"."push_subscriptions" (
 ALTER TABLE "public"."push_subscriptions" OWNER TO "postgres";
 
 
+CREATE TABLE IF NOT EXISTS "public"."quotation_lines" (
+    "id" "uuid" DEFAULT "gen_random_uuid"() NOT NULL,
+    "quotation_id" "uuid" NOT NULL,
+    "position" integer DEFAULT 0 NOT NULL,
+    "description_title" "text",
+    "description" "text",
+    "quantity" numeric(12,4),
+    "unit" "text",
+    "rate" numeric(12,4),
+    "amount_net" numeric(12,2) DEFAULT 0 NOT NULL,
+    "created_at" timestamp with time zone DEFAULT "now"() NOT NULL,
+    "updated_at" timestamp with time zone DEFAULT "now"() NOT NULL
+);
+
+
+ALTER TABLE "public"."quotation_lines" OWNER TO "postgres";
+
+
+CREATE SEQUENCE IF NOT EXISTS "public"."quotations_quote_number_seq"
+    AS integer
+    START WITH 1
+    INCREMENT BY 1
+    NO MINVALUE
+    NO MAXVALUE
+    CACHE 1;
+
+
+ALTER SEQUENCE "public"."quotations_quote_number_seq" OWNER TO "postgres";
+
+
+CREATE TABLE IF NOT EXISTS "public"."quotations" (
+    "id" "uuid" DEFAULT "gen_random_uuid"() NOT NULL,
+    "quote_number" integer DEFAULT "nextval"('"public"."quotations_quote_number_seq"'::"regclass") NOT NULL,
+    "quote_date" "date" DEFAULT CURRENT_DATE NOT NULL,
+    "client_id" "uuid",
+    "client_name_snapshot" "text" DEFAULT ''::"text" NOT NULL,
+    "client_address_snapshot" "text" DEFAULT ''::"text" NOT NULL,
+    "client_reference" "text",
+    "site_reference" "text",
+    "attention_name" "text",
+    "attention_email" "text",
+    "amount_net" numeric(12,2) DEFAULT 0 NOT NULL,
+    "nas_path" "text",
+    "nas_pushed_at" timestamp with time zone,
+    "created_by" "uuid",
+    "created_at" timestamp with time zone DEFAULT "now"() NOT NULL,
+    "updated_at" timestamp with time zone DEFAULT "now"() NOT NULL
+);
+
+
+ALTER TABLE "public"."quotations" OWNER TO "postgres";
+
+
 CREATE TABLE IF NOT EXISTS "public"."rams_attendees" (
     "id" "uuid" DEFAULT "gen_random_uuid"() NOT NULL,
     "briefing_id" "uuid" NOT NULL,
@@ -10692,6 +10775,21 @@ ALTER TABLE ONLY "public"."push_subscriptions"
 
 
 
+ALTER TABLE ONLY "public"."quotation_lines"
+    ADD CONSTRAINT "quotation_lines_pkey" PRIMARY KEY ("id");
+
+
+
+ALTER TABLE ONLY "public"."quotations"
+    ADD CONSTRAINT "quotations_pkey" PRIMARY KEY ("id");
+
+
+
+ALTER TABLE ONLY "public"."quotations"
+    ADD CONSTRAINT "quotations_quote_number_key" UNIQUE ("quote_number");
+
+
+
 ALTER TABLE ONLY "public"."rams_attendees"
     ADD CONSTRAINT "rams_attendees_pkey" PRIMARY KEY ("id");
 
@@ -11214,6 +11312,18 @@ CREATE INDEX "project_chat_room_members_user_idx" ON "public"."project_chat_room
 
 
 
+CREATE INDEX "quotation_lines_quotation_id_idx" ON "public"."quotation_lines" USING "btree" ("quotation_id");
+
+
+
+CREATE INDEX "quotations_client_id_idx" ON "public"."quotations" USING "btree" ("client_id");
+
+
+
+CREATE INDEX "quotations_quote_date_idx" ON "public"."quotations" USING "btree" ("quote_date" DESC);
+
+
+
 CREATE INDEX "rams_briefings_briefer_id_briefing_date_idx" ON "public"."rams_briefings" USING "btree" ("briefer_id", "briefing_date" DESC);
 
 
@@ -11646,6 +11756,18 @@ CREATE OR REPLACE TRIGGER "trg_invoices_updated" BEFORE UPDATE ON "public"."invo
 
 
 
+CREATE OR REPLACE TRIGGER "trg_quotation_lines_updated" BEFORE UPDATE ON "public"."quotation_lines" FOR EACH ROW EXECUTE FUNCTION "public"."set_updated_at"();
+
+
+
+CREATE OR REPLACE TRIGGER "trg_quotations_before_insert" BEFORE INSERT ON "public"."quotations" FOR EACH ROW EXECUTE FUNCTION "public"."quotations_before_insert"();
+
+
+
+CREATE OR REPLACE TRIGGER "trg_quotations_updated" BEFORE UPDATE ON "public"."quotations" FOR EACH ROW EXECUTE FUNCTION "public"."set_updated_at"();
+
+
+
 CREATE OR REPLACE TRIGGER "trg_revenue_entries_before_insert" BEFORE INSERT ON "public"."revenue_entries" FOR EACH ROW EXECUTE FUNCTION "public"."revenue_entries_before_insert"();
 
 
@@ -12033,6 +12155,21 @@ ALTER TABLE ONLY "public"."projects"
 
 ALTER TABLE ONLY "public"."push_subscriptions"
     ADD CONSTRAINT "push_subscriptions_user_id_fkey" FOREIGN KEY ("user_id") REFERENCES "auth"."users"("id") ON DELETE CASCADE;
+
+
+
+ALTER TABLE ONLY "public"."quotation_lines"
+    ADD CONSTRAINT "quotation_lines_quotation_id_fkey" FOREIGN KEY ("quotation_id") REFERENCES "public"."quotations"("id") ON DELETE CASCADE;
+
+
+
+ALTER TABLE ONLY "public"."quotations"
+    ADD CONSTRAINT "quotations_client_id_fkey" FOREIGN KEY ("client_id") REFERENCES "public"."invoice_clients"("id") ON DELETE SET NULL;
+
+
+
+ALTER TABLE ONLY "public"."quotations"
+    ADD CONSTRAINT "quotations_created_by_fkey" FOREIGN KEY ("created_by") REFERENCES "auth"."users"("id") ON DELETE SET NULL;
 
 
 
@@ -13056,6 +13193,20 @@ CREATE POLICY "push_subscriptions self insert" ON "public"."push_subscriptions" 
 
 
 CREATE POLICY "push_subscriptions self read" ON "public"."push_subscriptions" FOR SELECT TO "authenticated" USING (("user_id" = "auth"."uid"()));
+
+
+
+ALTER TABLE "public"."quotation_lines" ENABLE ROW LEVEL SECURITY;
+
+
+CREATE POLICY "quotation_lines invoices permission" ON "public"."quotation_lines" TO "authenticated" USING ("public"."has_permission"("auth"."uid"(), 'access.invoices'::"text", false)) WITH CHECK ("public"."has_permission"("auth"."uid"(), 'access.invoices'::"text", false));
+
+
+
+ALTER TABLE "public"."quotations" ENABLE ROW LEVEL SECURITY;
+
+
+CREATE POLICY "quotations invoices permission" ON "public"."quotations" TO "authenticated" USING ("public"."has_permission"("auth"."uid"(), 'access.invoices'::"text", false)) WITH CHECK ("public"."has_permission"("auth"."uid"(), 'access.invoices'::"text", false));
 
 
 
@@ -14847,6 +14998,12 @@ GRANT ALL ON FUNCTION "public"."projects_refresh_cost_search_text"() TO "service
 
 
 
+GRANT ALL ON FUNCTION "public"."quotations_before_insert"() TO "anon";
+GRANT ALL ON FUNCTION "public"."quotations_before_insert"() TO "authenticated";
+GRANT ALL ON FUNCTION "public"."quotations_before_insert"() TO "service_role";
+
+
+
 REVOKE ALL ON FUNCTION "public"."record_audit_event"("p_actor_id" "uuid", "p_action" "text", "p_entity_type" "text", "p_summary" "text", "p_entity_id" "uuid", "p_parent_type" "text", "p_parent_id" "uuid", "p_changes" "jsonb", "p_metadata" "jsonb") FROM PUBLIC;
 GRANT ALL ON FUNCTION "public"."record_audit_event"("p_actor_id" "uuid", "p_action" "text", "p_entity_type" "text", "p_summary" "text", "p_entity_id" "uuid", "p_parent_type" "text", "p_parent_id" "uuid", "p_changes" "jsonb", "p_metadata" "jsonb") TO "anon";
 GRANT ALL ON FUNCTION "public"."record_audit_event"("p_actor_id" "uuid", "p_action" "text", "p_entity_type" "text", "p_summary" "text", "p_entity_id" "uuid", "p_parent_type" "text", "p_parent_id" "uuid", "p_changes" "jsonb", "p_metadata" "jsonb") TO "authenticated";
@@ -15514,6 +15671,24 @@ GRANT ALL ON TABLE "public"."projects" TO "service_role";
 GRANT ALL ON TABLE "public"."push_subscriptions" TO "anon";
 GRANT ALL ON TABLE "public"."push_subscriptions" TO "authenticated";
 GRANT ALL ON TABLE "public"."push_subscriptions" TO "service_role";
+
+
+
+GRANT ALL ON TABLE "public"."quotation_lines" TO "anon";
+GRANT ALL ON TABLE "public"."quotation_lines" TO "authenticated";
+GRANT ALL ON TABLE "public"."quotation_lines" TO "service_role";
+
+
+
+GRANT ALL ON SEQUENCE "public"."quotations_quote_number_seq" TO "anon";
+GRANT ALL ON SEQUENCE "public"."quotations_quote_number_seq" TO "authenticated";
+GRANT ALL ON SEQUENCE "public"."quotations_quote_number_seq" TO "service_role";
+
+
+
+GRANT ALL ON TABLE "public"."quotations" TO "anon";
+GRANT ALL ON TABLE "public"."quotations" TO "authenticated";
+GRANT ALL ON TABLE "public"."quotations" TO "service_role";
 
 
 
