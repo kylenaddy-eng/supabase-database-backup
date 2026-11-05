@@ -9630,39 +9630,6 @@ CREATE TABLE IF NOT EXISTS "public"."invoice_units" (
 ALTER TABLE "public"."invoice_units" OWNER TO "postgres";
 
 
-CREATE TABLE IF NOT EXISTS "public"."job_supplier_purchase_orders" (
-    "project_id" "text" NOT NULL,
-    "po_reference" "text" NOT NULL,
-    "updated_at" timestamp with time zone DEFAULT "now"() NOT NULL,
-    "updated_by" "uuid"
-);
-
-
-ALTER TABLE "public"."job_supplier_purchase_orders" OWNER TO "postgres";
-
-
-CREATE TABLE IF NOT EXISTS "public"."material_order_emails" (
-    "id" "uuid" DEFAULT "gen_random_uuid"() NOT NULL,
-    "project_id" "text" NOT NULL,
-    "order_id" "text" NOT NULL,
-    "from_user_id" "uuid" NOT NULL,
-    "from_email" "text" NOT NULL,
-    "to_name" "text" DEFAULT ''::"text" NOT NULL,
-    "to_email" "text" NOT NULL,
-    "intent" "text" NOT NULL,
-    "subject" "text" NOT NULL,
-    "delivery" "text" DEFAULT ''::"text" NOT NULL,
-    "po_reference" "text" DEFAULT ''::"text" NOT NULL,
-    "sent_at" timestamp with time zone DEFAULT "now"() NOT NULL,
-    "message" "text" DEFAULT ''::"text" NOT NULL,
-    "job_code" "text" DEFAULT ''::"text" NOT NULL,
-    CONSTRAINT "material_order_emails_intent_check" CHECK (("intent" = ANY (ARRAY['order'::"text", 'quote'::"text"])))
-);
-
-
-ALTER TABLE "public"."material_order_emails" OWNER TO "postgres";
-
-
 CREATE TABLE IF NOT EXISTS "public"."nas_sync_queue" (
     "id" "uuid" DEFAULT "gen_random_uuid"() NOT NULL,
     "kind" "text" NOT NULL,
@@ -10139,18 +10106,6 @@ CREATE TABLE IF NOT EXISTS "public"."submission_photos" (
 ALTER TABLE "public"."submission_photos" OWNER TO "postgres";
 
 
-CREATE TABLE IF NOT EXISTS "public"."supplier_email_contacts" (
-    "id" "uuid" DEFAULT "gen_random_uuid"() NOT NULL,
-    "display_name" "text" DEFAULT ''::"text" NOT NULL,
-    "email" "text" NOT NULL,
-    "last_used_at" timestamp with time zone DEFAULT "now"() NOT NULL,
-    "created_by" "uuid"
-);
-
-
-ALTER TABLE "public"."supplier_email_contacts" OWNER TO "postgres";
-
-
 CREATE TABLE IF NOT EXISTS "public"."timesheet_days" (
     "id" "uuid" DEFAULT "gen_random_uuid"() NOT NULL,
     "timesheet_id" "uuid" NOT NULL,
@@ -10332,31 +10287,6 @@ CREATE TABLE IF NOT EXISTS "public"."toolbox_talks" (
 
 
 ALTER TABLE "public"."toolbox_talks" OWNER TO "postgres";
-
-
-CREATE TABLE IF NOT EXISTS "public"."user_email_signatures" (
-    "user_id" "uuid" NOT NULL,
-    "name" "text" DEFAULT ''::"text" NOT NULL,
-    "job_title" "text" DEFAULT ''::"text" NOT NULL,
-    "phone" "text" DEFAULT ''::"text" NOT NULL,
-    "email" "text" DEFAULT ''::"text" NOT NULL,
-    "address" "text" DEFAULT ''::"text" NOT NULL,
-    "updated_at" timestamp with time zone DEFAULT "now"() NOT NULL
-);
-
-
-ALTER TABLE "public"."user_email_signatures" OWNER TO "postgres";
-
-
-CREATE TABLE IF NOT EXISTS "public"."user_mail_connections" (
-    "user_id" "uuid" NOT NULL,
-    "email_address" "text" NOT NULL,
-    "refresh_token_secret" "text" NOT NULL,
-    "connected_at" timestamp with time zone DEFAULT "now"() NOT NULL
-);
-
-
-ALTER TABLE "public"."user_mail_connections" OWNER TO "postgres";
 
 
 CREATE TABLE IF NOT EXISTS "public"."user_notifications" (
@@ -10812,16 +10742,6 @@ ALTER TABLE ONLY "public"."invoices"
 
 
 
-ALTER TABLE ONLY "public"."job_supplier_purchase_orders"
-    ADD CONSTRAINT "job_supplier_purchase_orders_pkey" PRIMARY KEY ("project_id");
-
-
-
-ALTER TABLE ONLY "public"."material_order_emails"
-    ADD CONSTRAINT "material_order_emails_pkey" PRIMARY KEY ("id");
-
-
-
 ALTER TABLE ONLY "public"."nas_sync_queue"
     ADD CONSTRAINT "nas_sync_queue_pkey" PRIMARY KEY ("id");
 
@@ -10982,11 +10902,6 @@ ALTER TABLE ONLY "public"."submission_photos"
 
 
 
-ALTER TABLE ONLY "public"."supplier_email_contacts"
-    ADD CONSTRAINT "supplier_email_contacts_pkey" PRIMARY KEY ("id");
-
-
-
 ALTER TABLE ONLY "public"."timesheet_days"
     ADD CONSTRAINT "timesheet_days_pkey" PRIMARY KEY ("id");
 
@@ -11044,16 +10959,6 @@ ALTER TABLE ONLY "public"."toolbox_attendees"
 
 ALTER TABLE ONLY "public"."toolbox_talks"
     ADD CONSTRAINT "toolbox_talks_pkey" PRIMARY KEY ("id");
-
-
-
-ALTER TABLE ONLY "public"."user_email_signatures"
-    ADD CONSTRAINT "user_email_signatures_pkey" PRIMARY KEY ("user_id");
-
-
-
-ALTER TABLE ONLY "public"."user_mail_connections"
-    ADD CONSTRAINT "user_mail_connections_pkey" PRIMARY KEY ("user_id");
 
 
 
@@ -11425,10 +11330,6 @@ CREATE INDEX "invoices_search_document_idx" ON "public"."invoices" USING "gin" (
 
 
 
-CREATE INDEX "material_order_emails_order_idx" ON "public"."material_order_emails" USING "btree" ("project_id", "order_id", "sent_at" DESC);
-
-
-
 CREATE UNIQUE INDEX "nas_sync_queue_kind_submission_target_uidx" ON "public"."nas_sync_queue" USING "btree" ("kind", "submission_id", "pdf_target");
 
 
@@ -11526,10 +11427,6 @@ CREATE INDEX "subcontractors_archived_at_idx" ON "public"."subcontractors" USING
 
 
 CREATE INDEX "submission_photos_kind_submission_id_idx" ON "public"."submission_photos" USING "btree" ("kind", "submission_id");
-
-
-
-CREATE UNIQUE INDEX "supplier_email_contacts_email_uniq" ON "public"."supplier_email_contacts" USING "btree" ("lower"("email"));
 
 
 
@@ -12221,16 +12118,6 @@ ALTER TABLE ONLY "public"."invoices"
 
 
 
-ALTER TABLE ONLY "public"."job_supplier_purchase_orders"
-    ADD CONSTRAINT "job_supplier_purchase_orders_updated_by_fkey" FOREIGN KEY ("updated_by") REFERENCES "auth"."users"("id") ON DELETE SET NULL;
-
-
-
-ALTER TABLE ONLY "public"."material_order_emails"
-    ADD CONSTRAINT "material_order_emails_from_user_id_fkey" FOREIGN KEY ("from_user_id") REFERENCES "auth"."users"("id") ON DELETE CASCADE;
-
-
-
 ALTER TABLE ONLY "public"."notification_preferences"
     ADD CONSTRAINT "notification_preferences_user_id_fkey" FOREIGN KEY ("user_id") REFERENCES "auth"."users"("id") ON DELETE CASCADE;
 
@@ -12471,11 +12358,6 @@ ALTER TABLE ONLY "public"."subcontractors"
 
 
 
-ALTER TABLE ONLY "public"."supplier_email_contacts"
-    ADD CONSTRAINT "supplier_email_contacts_created_by_fkey" FOREIGN KEY ("created_by") REFERENCES "auth"."users"("id") ON DELETE SET NULL;
-
-
-
 ALTER TABLE ONLY "public"."timesheet_days"
     ADD CONSTRAINT "timesheet_days_project_id_fkey" FOREIGN KEY ("project_id") REFERENCES "public"."projects"("id") ON DELETE SET NULL;
 
@@ -12618,16 +12500,6 @@ ALTER TABLE ONLY "public"."toolbox_talks"
 
 ALTER TABLE ONLY "public"."toolbox_talks"
     ADD CONSTRAINT "toolbox_talks_project_id_fkey" FOREIGN KEY ("project_id") REFERENCES "public"."projects"("id");
-
-
-
-ALTER TABLE ONLY "public"."user_email_signatures"
-    ADD CONSTRAINT "user_email_signatures_user_id_fkey" FOREIGN KEY ("user_id") REFERENCES "auth"."users"("id") ON DELETE CASCADE;
-
-
-
-ALTER TABLE ONLY "public"."user_mail_connections"
-    ADD CONSTRAINT "user_mail_connections_user_id_fkey" FOREIGN KEY ("user_id") REFERENCES "auth"."users"("id") ON DELETE CASCADE;
 
 
 
@@ -13240,12 +13112,6 @@ CREATE POLICY "invoices admin all" ON "public"."invoices" TO "authenticated" USI
 
 
 
-ALTER TABLE "public"."job_supplier_purchase_orders" ENABLE ROW LEVEL SECURITY;
-
-
-ALTER TABLE "public"."material_order_emails" ENABLE ROW LEVEL SECURITY;
-
-
 ALTER TABLE "public"."nas_sync_queue" ENABLE ROW LEVEL SECURITY;
 
 
@@ -13607,9 +13473,6 @@ CREATE POLICY "super_admin manage website contact email" ON "public"."website_co
 
 
 
-ALTER TABLE "public"."supplier_email_contacts" ENABLE ROW LEVEL SECURITY;
-
-
 CREATE POLICY "tbx admin delete" ON "public"."toolbox_talks" FOR DELETE TO "authenticated" USING ("public"."has_role_app_role_deprecated"("auth"."uid"(), 'admin'::"public"."app_role"));
 
 
@@ -13797,12 +13660,6 @@ ALTER TABLE "public"."toolbox_attendees" ENABLE ROW LEVEL SECURITY;
 
 
 ALTER TABLE "public"."toolbox_talks" ENABLE ROW LEVEL SECURITY;
-
-
-ALTER TABLE "public"."user_email_signatures" ENABLE ROW LEVEL SECURITY;
-
-
-ALTER TABLE "public"."user_mail_connections" ENABLE ROW LEVEL SECURITY;
 
 
 ALTER TABLE "public"."user_notifications" ENABLE ROW LEVEL SECURITY;
@@ -15797,14 +15654,6 @@ GRANT ALL ON TABLE "public"."invoice_units" TO "service_role";
 
 
 
-GRANT ALL ON TABLE "public"."job_supplier_purchase_orders" TO "service_role";
-
-
-
-GRANT ALL ON TABLE "public"."material_order_emails" TO "service_role";
-
-
-
 GRANT ALL ON TABLE "public"."nas_sync_queue" TO "anon";
 GRANT ALL ON TABLE "public"."nas_sync_queue" TO "authenticated";
 GRANT ALL ON TABLE "public"."nas_sync_queue" TO "service_role";
@@ -16023,10 +15872,6 @@ GRANT ALL ON TABLE "public"."submission_photos" TO "service_role";
 
 
 
-GRANT ALL ON TABLE "public"."supplier_email_contacts" TO "service_role";
-
-
-
 GRANT ALL ON TABLE "public"."timesheet_days" TO "anon";
 GRANT ALL ON TABLE "public"."timesheet_days" TO "authenticated";
 GRANT ALL ON TABLE "public"."timesheet_days" TO "service_role";
@@ -16090,14 +15935,6 @@ GRANT ALL ON TABLE "public"."toolbox_attendees" TO "service_role";
 GRANT ALL ON TABLE "public"."toolbox_talks" TO "anon";
 GRANT ALL ON TABLE "public"."toolbox_talks" TO "authenticated";
 GRANT ALL ON TABLE "public"."toolbox_talks" TO "service_role";
-
-
-
-GRANT ALL ON TABLE "public"."user_email_signatures" TO "service_role";
-
-
-
-GRANT ALL ON TABLE "public"."user_mail_connections" TO "service_role";
 
 
 
